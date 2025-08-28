@@ -1109,6 +1109,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "openai-api-rs",
@@ -1120,6 +1122,7 @@ dependencies = [
  "text-splitter",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http",
  "walkdir",
 ]

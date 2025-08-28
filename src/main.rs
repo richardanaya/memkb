@@ -5,6 +5,9 @@ use hyper_util::{
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
+use hyper::{body::{Incoming, Bytes}, service::Service, Request, Response, Method, StatusCode};
+use futures::future::{BoxFuture, FutureExt};
+use http_body_util::{BodyExt, Full};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -44,6 +47,9 @@ struct Args {
     
     #[arg(short = 'o', long, default_value = "200")]
     overlap: usize,
+    
+    #[arg(long)]
+    test: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -62,37 +68,51 @@ pub struct MemoryKB {
     directory: String,
     chunks: Arc<Mutex<Vec<TextChunk>>>,
     embedding_client: Option<Arc<Mutex<OpenAIClient>>>,
+    generation_client: Option<Arc<Mutex<OpenAIClient>>>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl MemoryKB {
-    fn new(directory: String, embedding_client: Option<Arc<Mutex<OpenAIClient>>>) -> Self {
+    fn new(directory: String, embedding_client: Option<Arc<Mutex<OpenAIClient>>>, generation_client: Option<Arc<Mutex<OpenAIClient>>>) -> Self {
         Self {
             directory,
             chunks: Arc::new(Mutex::new(Vec::new())),
             embedding_client,
+            generation_client,
             tool_router: Self::tool_router(),
         }
     }
 
-    #[tool(name = "ask", description = "Ask a question and get relevant content from all markdown files")]
+    #[tool(name = "ask", description = "Ask a question and get an AI-generated answer based on relevant content from markdown files")]
     async fn ask(&self, params: Parameters<AskRequest>) -> Result<CallToolResult, McpError> {
         let prompt = &params.0.prompt;
         
         // If no embedding client, fall back to returning all content
         if self.embedding_client.is_none() {
-            match read_and_merge_markdown_files(&self.directory) {
-                Ok(merged_content) => {
-                    return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                        merged_content,
-                    )]));
-                }
+            let merged_content = match read_and_merge_markdown_files(&self.directory) {
+                Ok(content) => content,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
                         format!("Error reading markdown files: {}", e),
                     )]));
                 }
+            };
+            
+            // Try to generate answer with all content if generation client is available
+            if let Some(gen_client) = &self.generation_client {
+                match generate_answer(gen_client, prompt, &merged_content).await {
+                    Ok(answer) => {
+                        return Ok(CallToolResult::success(vec![rmcp::model::Content::text(answer)]));
+                    }
+                    Err(e) => {
+                        return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                            format!("Error generating answer: {}. Returning raw content:\n\n{}", e, merged_content),
+                        )]));
+                    }
+                }
+            } else {
+                return Ok(CallToolResult::success(vec![rmcp::model::Content::text(merged_content)]));
             }
         }
         
@@ -126,12 +146,11 @@ impl MemoryKB {
             )]));
         }
         
-        // Format response with top similar chunks
-        let mut response = format!("Top {} relevant chunks for your query:\n\n", similar_chunks.len());
-        
+        // Collect relevant content for context
+        let mut context = String::new();
         for (i, (similarity, chunk)) in similar_chunks.iter().enumerate() {
-            response.push_str(&format!(
-                "**Chunk {} (Similarity: {:.3})** - From: {}\n{}\n\n---\n\n",
+            context.push_str(&format!(
+                "Context {} (Similarity: {:.3}) - From: {}\n{}\n\n",
                 i + 1,
                 similarity,
                 chunk.source_file,
@@ -139,9 +158,26 @@ impl MemoryKB {
             ));
         }
         
-        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            response,
-        )]))
+        // Generate answer using the context
+        if let Some(gen_client) = &self.generation_client {
+            match generate_answer(gen_client, prompt, &context).await {
+                Ok(answer) => {
+                    Ok(CallToolResult::success(vec![rmcp::model::Content::text(answer)]))
+                }
+                Err(e) => {
+                    // Fall back to returning chunks if generation fails
+                    let fallback_response = format!(
+                        "Error generating answer: {}. Here are the relevant chunks:\n\n{}",
+                        e, context
+                    );
+                    Ok(CallToolResult::success(vec![rmcp::model::Content::text(fallback_response)]))
+                }
+            }
+        } else {
+            // No generation client, return formatted chunks
+            let response = format!("Top {} relevant chunks for your query:\n\n{}", similar_chunks.len(), context);
+            Ok(CallToolResult::success(vec![rmcp::model::Content::text(response)]))
+        }
     }
 }
 
@@ -339,6 +375,49 @@ async fn generate_embedding(client: &mut OpenAIClient, text: &str) -> anyhow::Re
     }
 }
 
+async fn generate_answer(client: &Arc<Mutex<OpenAIClient>>, question: &str, context: &str) -> anyhow::Result<String> {
+    let mut client_guard = client.lock().await;
+    
+    let system_prompt = "You are a helpful assistant that answers questions based on the provided context. If the context doesn't contain relevant information to answer the question, respond with \"We don't have any information on that question\". Always base your answer strictly on the provided context and be concise.";
+    
+    let user_prompt = format!(
+        "Context:\n{}\n\nQuestion: {}\n\nPlease provide a helpful answer based on the context above.",
+        context, question
+    );
+    
+    let req = ChatCompletionRequest::new(
+        "gpt-3.5-turbo".to_string(),
+        vec![
+            ChatCompletionMessage {
+                role: MessageRole::system,
+                content: chat_completion::Content::Text(system_prompt.to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatCompletionMessage {
+                role: MessageRole::user,
+                content: chat_completion::Content::Text(user_prompt),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ],
+    );
+    
+    let response = client_guard.chat_completion(req).await?;
+    
+    if let Some(choice) = response.choices.first() {
+        if let Some(content) = &choice.message.content {
+            Ok(content.to_string())
+        } else {
+            Err(anyhow::anyhow!("No content in response"))
+        }
+    } else {
+        Err(anyhow::anyhow!("No choices in response"))
+    }
+}
+
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     // Use simsimd for optimized SIMD-accelerated cosine similarity
     // Note: simsimd cosine returns distance (0 = identical, 2 = opposite)
@@ -367,6 +446,186 @@ async fn find_similar_chunks<'a>(
     
     // Return top k results
     similarities.into_iter().take(top_k).collect()
+}
+
+#[derive(Clone)]
+struct TestServer {
+    chunks: Arc<Mutex<Vec<TextChunk>>>,
+    embedding_client: Option<Arc<Mutex<OpenAIClient>>>,
+    directory: String,
+}
+
+impl Service<Request<Incoming>> for TestServer {
+    type Response = Response<Full<Bytes>>;
+    type Error = hyper::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
+        let chunks = self.chunks.clone();
+        let embedding_client = self.embedding_client.clone();
+        let _directory = self.directory.clone();
+        
+        async move {
+            match (req.method(), req.uri().path()) {
+                (&Method::GET, "/") => {
+                    let html = r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MemKB Test Interface</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .search-form { margin-bottom: 20px; }
+        input[type="text"] { width: 70%; padding: 10px; }
+        button { padding: 10px 20px; }
+        .results { background: #f5f5f5; padding: 15px; border-radius: 5px; }
+        .chunk { margin-bottom: 15px; padding: 10px; background: white; border-radius: 3px; }
+        .chunk-meta { color: #666; font-size: 0.9em; margin-bottom: 5px; }
+    </style>
+</head>
+<body>
+    <h1>MemKB Knowledge Base Search</h1>
+    <div class="search-form">
+        <input type="text" id="query" placeholder="Enter your search query..." />
+        <button onclick="search()">Search</button>
+    </div>
+    <div id="results"></div>
+
+    <script>
+        async function search() {
+            const query = document.getElementById('query').value;
+            const resultsDiv = document.getElementById('results');
+            
+            if (!query.trim()) {
+                resultsDiv.innerHTML = '<p>Please enter a search query.</p>';
+                return;
+            }
+            
+            resultsDiv.innerHTML = '<p>Searching...</p>';
+            
+            try {
+                const response = await fetch('/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: query })
+                });
+                
+                const data = await response.json();
+                
+                if (data.results && data.results.length > 0) {
+                    let html = '<div class="results">';
+                    data.results.forEach((result, i) => {
+                        html += `<div class="chunk">
+                            <div class="chunk-meta">Chunk ${i + 1} - Similarity: ${result.similarity.toFixed(3)} - From: ${result.source_file}</div>
+                            <div>${result.content}</div>
+                        </div>`;
+                    });
+                    html += '</div>';
+                    resultsDiv.innerHTML = html;
+                } else {
+                    resultsDiv.innerHTML = '<div class="results"><p>No results found.</p></div>';
+                }
+            } catch (error) {
+                resultsDiv.innerHTML = `<div class="results"><p>Error: ${error.message}</p></div>`;
+            }
+        }
+        
+        document.getElementById('query').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                search();
+            }
+        });
+    </script>
+</body>
+</html>
+"#;
+                    Ok(Response::builder()
+                        .header("content-type", "text/html")
+                        .body(Full::from(html)).unwrap())
+                },
+                (&Method::POST, "/search") => {
+                    let body_bytes = match req.into_body().collect().await {
+                        Ok(collected) => collected.to_bytes(),
+                        Err(_) => {
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(Full::from("Invalid request body")).unwrap());
+                        }
+                    };
+                    
+                    let search_req: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                        Ok(req) => req,
+                        Err(_) => {
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(Full::from("Invalid JSON")).unwrap());
+                        }
+                    };
+                    
+                    let query = match search_req.get("query").and_then(|q| q.as_str()) {
+                        Some(q) => q,
+                        None => {
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(Full::from("Missing query field")).unwrap());
+                        }
+                    };
+                    
+                    let results = if let Some(client) = &embedding_client {
+                        // Use embedding search
+                        match {
+                            let mut client_guard = client.lock().await;
+                            generate_embedding(&mut *client_guard, query).await
+                        } {
+                            Ok(query_embedding) => {
+                                let chunks_guard = chunks.lock().await;
+                                let similar_chunks = find_similar_chunks(&query_embedding, &chunks_guard, 5).await;
+                                
+                                let mut results = Vec::new();
+                                for (similarity, chunk) in similar_chunks {
+                                    results.push(serde_json::json!({
+                                        "similarity": similarity,
+                                        "content": chunk.content,
+                                        "source_file": chunk.source_file
+                                    }));
+                                }
+                                results
+                            }
+                            Err(_) => Vec::new(),
+                        }
+                    } else {
+                        // Fallback to simple text matching
+                        let chunks_guard = chunks.lock().await;
+                        let mut results = Vec::new();
+                        let query_lower = query.to_lowercase();
+                        
+                        for chunk in chunks_guard.iter() {
+                            if chunk.content.to_lowercase().contains(&query_lower) {
+                                results.push(serde_json::json!({
+                                    "similarity": 1.0,
+                                    "content": chunk.content,
+                                    "source_file": chunk.source_file
+                                }));
+                                if results.len() >= 5 { break; }
+                            }
+                        }
+                        results
+                    };
+                    
+                    let response_json = serde_json::json!({ "results": results });
+                    
+                    Ok(Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Full::from(response_json.to_string())).unwrap())
+                },
+                _ => {
+                    Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Full::from("Not Found")).unwrap())
+                }
+            }
+        }.boxed()
+    }
 }
 
 #[tokio::main]
@@ -423,6 +682,16 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     
+    // Initialize generation client if URL provided
+    let generation_client = if let Some(generation_url) = &args.generation_url {
+        Some(Arc::new(Mutex::new(OpenAIClient::builder()
+            .with_endpoint(generation_url)
+            .with_api_key("test")
+            .build().unwrap())))
+    } else {
+        None
+    };
+    
     // Process and embed all markdown files
     println!("🧠 Processing and embedding markdown files...");
     println!("📏 Chunk size: {} characters, Overlap: {} characters", args.chunk_size, args.overlap);
@@ -441,20 +710,61 @@ async fn main() -> anyhow::Result<()> {
     println!("Press Ctrl+C to stop the server");
     println!();
     
-    let directory = args.directory.clone();
+    let bind_addr = format!("{}:{}", args.host, args.port);
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    
+    // Prepare shared chunks
     let chunks_arc = Arc::new(Mutex::new(chunks));
+    
+    // Start MCP server
+    let directory = args.directory.clone();
+    let mcp_chunks_arc = chunks_arc.clone();
     let embedding_client_arc = embedding_client.clone();
-    let service = TowerToHyperService::new(StreamableHttpService::new(
+    let generation_client_arc = generation_client.clone();
+    let mcp_service = TowerToHyperService::new(StreamableHttpService::new(
         move || {
-            let mut kb = MemoryKB::new(directory.clone(), embedding_client_arc.clone());
-            kb.chunks = chunks_arc.clone();
+            let mut kb = MemoryKB::new(directory.clone(), embedding_client_arc.clone(), generation_client_arc.clone());
+            kb.chunks = mcp_chunks_arc.clone();
             Ok(kb)
         },
         LocalSessionManager::default().into(),
         Default::default(),
     ));
-    let bind_addr = format!("{}:{}", args.host, args.port);
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    
+    if args.test {
+        // Start additional test HTTP server on port + 1
+        let test_port = args.port + 1;
+        let test_bind_addr = format!("{}:{}", args.host, test_port);
+        let test_listener = tokio::net::TcpListener::bind(&test_bind_addr).await?;
+        
+        println!("🧪 Starting test HTTP server at http://{}", test_bind_addr);
+        println!("   Open your browser to test the search interface");
+        
+        let test_service = TestServer {
+            chunks: chunks_arc.clone(),
+            embedding_client: embedding_client.clone(),
+            directory: args.directory.clone(),
+        };
+        
+        // Spawn test server task
+        tokio::spawn(async move {
+            loop {
+                let io = tokio::select! {
+                    accept = test_listener.accept() => {
+                        TokioIo::new(accept.unwrap().0)
+                    }
+                };
+                let service = test_service.clone();
+                tokio::spawn(async move {
+                    let _result = Builder::new(TokioExecutor::default())
+                        .serve_connection_with_upgrades(io, hyper::service::service_fn(move |req| service.call(req)))
+                        .await;
+                });
+            }
+        });
+    }
+    
+    // Run main MCP server
     loop {
         let io = tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -462,7 +772,7 @@ async fn main() -> anyhow::Result<()> {
                 TokioIo::new(accept?.0)
             }
         };
-        let service = service.clone();
+        let service = mcp_service.clone();
         tokio::spawn(async move {
             let _result = Builder::new(TokioExecutor::default())
                 .serve_connection(io, service)

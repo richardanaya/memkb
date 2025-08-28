@@ -49,12 +49,25 @@ struct Args {
     overlap: usize,
     
     #[arg(long)]
-    test: bool,
+    http: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct AskRequest {
     prompt: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Message {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StreamRequest {
+    model: Option<String>,
+    messages: Vec<Message>,
+    stream: bool
 }
 
 #[derive(Clone, Debug)]
@@ -84,7 +97,7 @@ impl MemoryKB {
         }
     }
 
-    #[tool(name = "ask", description = "Ask a question and get an AI-generated answer based on relevant content from markdown files")]
+    #[tool(name = "ask_question", description = "Ask a question of the knowledge base")]
     async fn ask(&self, params: Parameters<AskRequest>) -> Result<CallToolResult, McpError> {
         let prompt = &params.0.prompt;
         
@@ -449,13 +462,14 @@ async fn find_similar_chunks<'a>(
 }
 
 #[derive(Clone)]
-struct TestServer {
+struct StreamServer {
     chunks: Arc<Mutex<Vec<TextChunk>>>,
     embedding_client: Option<Arc<Mutex<OpenAIClient>>>,
+    generation_client: Option<Arc<Mutex<OpenAIClient>>>,
     directory: String,
 }
 
-impl Service<Request<Incoming>> for TestServer {
+impl Service<Request<Incoming>> for StreamServer {
     type Response = Response<Full<Bytes>>;
     type Error = hyper::Error;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
@@ -463,6 +477,7 @@ impl Service<Request<Incoming>> for TestServer {
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let chunks = self.chunks.clone();
         let embedding_client = self.embedding_client.clone();
+        let generation_client = self.generation_client.clone();
         let _directory = self.directory.clone();
         
         async move {
@@ -618,6 +633,234 @@ impl Service<Request<Incoming>> for TestServer {
                         .header("content-type", "application/json")
                         .body(Full::from(response_json.to_string())).unwrap())
                 },
+                (&Method::POST, "/v1/chat/completions") => {
+                    println!("📡 Received POST request to /api/stream");
+                    
+                    let body_bytes = match req.into_body().collect().await {
+                        Ok(collected) => collected.to_bytes(),
+                        Err(e) => {
+                            println!("❌ Failed to read request body: {:?}", e);
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(Full::from("Invalid request body")).unwrap());
+                        }
+                    };
+                    
+                    println!("📄 Request body size: {} bytes", body_bytes.len());
+                    
+                    let stream_req: StreamRequest = match serde_json::from_slice::<StreamRequest>(&body_bytes) {
+                        Ok(req) => {
+                            println!("✅ Successfully parsed StreamRequest");
+                            println!("💬 Message count: {}", req.messages.len());
+                            req
+                        },
+                        Err(e) => {
+                            println!("❌ Failed to parse JSON: {:?}", e);
+                            println!("📄 Raw body: {}", String::from_utf8_lossy(&body_bytes));
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(Full::from("Invalid JSON")).unwrap());
+                        }
+                    };
+                    
+                    // Extract the user message (latest message from user)
+                    let user_message = stream_req.messages
+                        .iter()
+                        .rev()
+                        .find(|msg| msg.role == "user")
+                        .map(|msg| msg.content.as_str())
+                        .unwrap_or("");
+                    
+                    println!("🔍 Extracted user message: '{}'", user_message);
+                    
+                    if user_message.is_empty() {
+                        println!("❌ No user message found in request");
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Full::from("No user message found")).unwrap());
+                    }
+                    
+                    // Get relevant context from knowledge base
+                    println!("🧠 Searching knowledge base for context...");
+                    let context = if let Some(client) = &embedding_client {
+                        println!("🔤 Generating embedding for user message...");
+                        match {
+                            let mut client_guard = client.lock().await;
+                            generate_embedding(&mut *client_guard, user_message).await
+                        } {
+                            Ok(query_embedding) => {
+                                println!("✅ Embedding generated, searching for similar chunks...");
+                                let chunks_guard = chunks.lock().await;
+                                let similar_chunks = find_similar_chunks(&query_embedding, &chunks_guard, 3).await;
+                                println!("📚 Found {} similar chunks", similar_chunks.len());
+                                
+                                let mut context_str = String::new();
+                                for (i, (similarity, chunk)) in similar_chunks.iter().enumerate() {
+                                    println!("  {}. Similarity: {:.3}, Source: {}", i + 1, similarity, chunk.source_file);
+                                    context_str.push_str(&format!(
+                                        "Context (Similarity: {:.3}) - From: {}\n{}\n\n",
+                                        similarity,
+                                        chunk.source_file,
+                                        chunk.content
+                                    ));
+                                }
+                                context_str
+                            }
+                            Err(e) => {
+                                println!("❌ Failed to generate embedding: {:?}", e);
+                                String::new()
+                            },
+                        }
+                    } else {
+                        println!("⚠️  No embedding client available, skipping context search");
+                        String::new()
+                    };
+                    
+                    // Augment the system message or last message with context if available
+                    let mut augmented_messages = stream_req.messages.clone();
+                    if !context.is_empty() {
+                        println!("📝 Augmenting messages with knowledge base context");
+                        // Find system message and augment it, or create one
+                        let system_augmentation = format!("\n\nRelevant context from knowledge base:\n{}", context);
+                        
+                        if let Some(system_msg) = augmented_messages.iter_mut().find(|msg| msg.role == "system") {
+                            println!("🔧 Augmenting existing system message");
+                            system_msg.content.push_str(&system_augmentation);
+                        } else {
+                            println!("➕ Creating new system message with context");
+                            // Insert system message at the beginning
+                            augmented_messages.insert(0, Message {
+                                role: "system".to_string(),
+                                content: format!("You are a helpful assistant. Use the following context to help answer questions:{}", system_augmentation),
+                            });
+                        }
+                    } else {
+                        println!("⚠️  No context found, proceeding without augmentation");
+                    }
+                    
+                    // Use the OpenAI generation client
+                    match &generation_client {
+                        Some(client) => {
+                            println!("🚀 Using OpenAI generation client");
+                            
+                            // Convert messages to OpenAI format
+                            let mut openai_messages = Vec::new();
+                            for msg in augmented_messages {
+                                let role = match msg.role.as_str() {
+                                    "system" => MessageRole::system,
+                                    "user" => MessageRole::user,
+                                    "assistant" => MessageRole::assistant,
+                                    _ => MessageRole::user,
+                                };
+                                
+                                openai_messages.push(ChatCompletionMessage {
+                                    role,
+                                    content: chat_completion::Content::Text(msg.content),
+                                    name: None,
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                });
+                            }
+                            
+                            let chat_request = ChatCompletionRequest::new(
+                                "gpt-3.5-turbo".to_string(),
+                                openai_messages,
+                            );
+                            
+                            println!("📤 Sending chat completion request with {} messages", chat_request.messages.len());
+                            
+                            match {
+                                let mut client_guard = client.lock().await;
+                                client_guard.chat_completion(chat_request).await
+                            } {
+                                Ok(response) => {
+                                    println!("✅ Received successful response from generation client");
+                                    
+                                    if let Some(choice) = response.choices.first() {
+                                        if let Some(content) = &choice.message.content {
+                                            if stream_req.stream {
+                                                println!("🌊 Streaming response requested, simulating token stream");
+                                                // Create streaming response
+                                                let words: Vec<&str> = content.split_whitespace().collect();
+                                                let mut sse_response = String::new();
+                                                
+                                                // Send each word as a separate chunk
+                                                for (i, word) in words.iter().enumerate() {
+                                                    let chunk_data = serde_json::json!({
+                                                        "choices": [{
+                                                            "delta": {
+                                                                "content": if i == 0 { word.to_string() } else { format!(" {}", word) }
+                                                            },
+                                                            "index": 0,
+                                                            "finish_reason": null
+                                                        }]
+                                                    });
+                                                    
+                                                    sse_response.push_str(&format!("data: {}\n\n", chunk_data));
+                                                }
+                                                
+                                                // Send final chunk with finish_reason
+                                                let final_chunk = serde_json::json!({
+                                                    "choices": [{
+                                                        "delta": {},
+                                                        "index": 0,
+                                                        "finish_reason": "stop"
+                                                    }]
+                                                });
+                                                sse_response.push_str(&format!("data: {}\n\n", final_chunk));
+                                                sse_response.push_str("data: [DONE]\n\n");
+                                                
+                                                Ok(Response::builder()
+                                                    .header("content-type", "text/event-stream")
+                                                    .header("cache-control", "no-cache")
+                                                    .header("connection", "keep-alive")
+                                                    .body(Full::from(sse_response)).unwrap())
+                                            } else {
+                                                println!("📄 Non-streaming response requested");
+                                                let response_json = serde_json::json!({
+                                                    "choices": [{
+                                                        "message": {
+                                                            "role": "assistant",
+                                                            "content": content
+                                                        },
+                                                        "finish_reason": choice.finish_reason
+                                                    }],
+                                                    "usage": response.usage
+                                                });
+                                                
+                                                Ok(Response::builder()
+                                                    .header("content-type", "application/json")
+                                                    .body(Full::from(response_json.to_string())).unwrap())
+                                            }
+                                        } else {
+                                            println!("❌ No content in response message");
+                                            Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .body(Full::from("No content in response")).unwrap())
+                                        }
+                                    } else {
+                                        println!("❌ No choices in response");
+                                        Ok(Response::builder()
+                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(Full::from("No choices in response")).unwrap())
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("❌ Generation client error: {:?}", e);
+                                    Ok(Response::builder()
+                                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                        .body(Full::from(format!("Generation error: {}", e))).unwrap())
+                                }
+                            }
+                        }
+                        None => {
+                            println!("❌ No generation client configured");
+                            Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(Full::from("No generation client configured")).unwrap())
+                        }
+                    }
+                },
                 _ => {
                     Ok(Response::builder()
                         .status(StatusCode::NOT_FOUND)
@@ -731,30 +974,34 @@ async fn main() -> anyhow::Result<()> {
         Default::default(),
     ));
     
-    if args.test {
-        // Start additional test HTTP server on port + 1
-        let test_port = args.port + 1;
-        let test_bind_addr = format!("{}:{}", args.host, test_port);
-        let test_listener = tokio::net::TcpListener::bind(&test_bind_addr).await?;
+    if args.http {
+        // Start additional HTTP server on port + 1
+        let http_port = args.port + 1;
+        let http_bind_addr = format!("{}:{}", args.host, http_port);
+        let http_listener = tokio::net::TcpListener::bind(&http_bind_addr).await?;
         
-        println!("🧪 Starting test HTTP server at http://{}", test_bind_addr);
-        println!("   Open your browser to test the search interface");
+        println!("🌐 Starting HTTP server at http://{}", http_bind_addr);
+        println!("   Available endpoints:");
+        println!("     GET  / - Search interface");
+        println!("     POST /search - Search knowledge base"); 
+        println!("     POST /api/stream - Streaming endpoint with knowledge augmentation");
         
-        let test_service = TestServer {
+        let stream_service = StreamServer {
             chunks: chunks_arc.clone(),
             embedding_client: embedding_client.clone(),
+            generation_client: generation_client.clone(),
             directory: args.directory.clone(),
         };
         
-        // Spawn test server task
+        // Spawn HTTP server task
         tokio::spawn(async move {
             loop {
                 let io = tokio::select! {
-                    accept = test_listener.accept() => {
+                    accept = http_listener.accept() => {
                         TokioIo::new(accept.unwrap().0)
                     }
                 };
-                let service = test_service.clone();
+                let service = stream_service.clone();
                 tokio::spawn(async move {
                     let _result = Builder::new(TokioExecutor::default())
                         .serve_connection_with_upgrades(io, hyper::service::service_fn(move |req| service.call(req)))

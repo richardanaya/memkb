@@ -12,6 +12,7 @@ A Rust-based MCP (Model Context Protocol) server that provides AI-powered semant
 ### Basic Usage 
 ```bash
 # With embedding and generation servers
+cargo install memkb
 memkb --directory ./docs -e http://127.0.0.1:9095/v1 -g http://127.0.0.1:9091/v1
 ```
 

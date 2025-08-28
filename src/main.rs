@@ -428,6 +428,70 @@ async fn generate_embedding(client: &mut OpenAIClient, text: &str) -> anyhow::Re
     }
 }
 
+// Generate search questions based on conversation context
+async fn generate_search_questions(
+    client: &Arc<Mutex<OpenAIClient>>,
+    messages: &[Message],
+) -> anyhow::Result<Vec<String>> {
+    let mut client_guard = client.lock().await;
+
+    // Build conversation context for question generation
+    let mut conversation_context = String::new();
+    for msg in messages.iter().take(10) {
+        // Last 10 messages for context
+        conversation_context.push_str(&format!("{}: {}\n", msg.role, msg.content));
+    }
+
+    let system_prompt = "You are a search query generator. Given a conversation, generate 2-3 specific search questions that would help provide relevant context from a knowledge base to continue the conversation naturally. Return only the questions, one per line, without numbering or bullets.";
+
+    let user_prompt = format!(
+        "Conversation:\n{}\n\nGenerate 2-3 specific search questions that would help provide relevant context:",
+        conversation_context.trim()
+    );
+
+    let req = ChatCompletionRequest::new(
+        "gpt-3.5-turbo".to_string(),
+        vec![
+            ChatCompletionMessage {
+                role: MessageRole::system,
+                content: chat_completion::Content::Text(system_prompt.to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatCompletionMessage {
+                role: MessageRole::user,
+                content: chat_completion::Content::Text(user_prompt),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ],
+    );
+
+    let response = client_guard.chat_completion(req).await?;
+
+    if let Some(choice) = response.choices.first() {
+        if let Some(content) = &choice.message.content {
+            // Parse questions from response (one per line)
+            let questions: Vec<String> = content
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect();
+            Ok(questions)
+        } else {
+            Err(anyhow::anyhow!(
+                "No content in question generation response"
+            ))
+        }
+    } else {
+        Err(anyhow::anyhow!(
+            "No choices in question generation response"
+        ))
+    }
+}
+
 async fn generate_answer(
     client: &Arc<Mutex<OpenAIClient>>,
     question: &str,
@@ -481,6 +545,62 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     // We convert to similarity (1 = identical, -1 = opposite)
     let distance = f32::cosine(a, b).unwrap_or(2.0);
     (1.0 - (distance / 2.0)) as f32
+}
+
+// Search knowledge base for multiple questions and return combined context
+async fn search_knowledge_base_for_questions(
+    questions: &[String],
+    embedding_client: &Option<Arc<Mutex<OpenAIClient>>>,
+    chunks: &[TextChunk],
+) -> anyhow::Result<String> {
+    if questions.is_empty() {
+        return Ok(String::new());
+    }
+
+    let Some(client) = embedding_client else {
+        return Ok(String::new());
+    };
+
+    let mut all_relevant_chunks = Vec::new();
+
+    for question in questions.iter() {
+        // Generate embedding for this question
+        let mut client_guard = client.lock().await;
+        match generate_embedding(&mut *client_guard, question).await {
+            Ok(query_embedding) => {
+                drop(client_guard); // Release the lock
+                let similar_chunks = find_similar_chunks(&query_embedding, chunks, 2).await; // Top 2 per question
+                all_relevant_chunks.extend(similar_chunks);
+            }
+            Err(_e) => {
+                // Silently skip failed embeddings
+            }
+        }
+    }
+
+    // Remove duplicates and sort by similarity
+    all_relevant_chunks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    all_relevant_chunks
+        .dedup_by(|a, b| a.1.source_file == b.1.source_file && a.1.content == b.1.content);
+
+    // Take top 5 overall
+    let top_chunks: Vec<_> = all_relevant_chunks.into_iter().take(5).collect();
+
+    if top_chunks.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Format as tool context
+    let mut context = String::new();
+    for (_similarity, chunk) in &top_chunks {
+        context.push_str(&format!(
+            "From {}: {}\n\n",
+            chunk.source_file,
+            chunk.content.trim()
+        ));
+    }
+
+    Ok(context.trim().to_string())
 }
 
 async fn find_similar_chunks<'a>(
@@ -542,7 +662,7 @@ impl Service<Request<Incoming>> for StreamServer {
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let chunks = self.chunks.clone();
         let embedding_client = self.embedding_client.clone();
-        let _generation_client = self.generation_client.clone();
+        let generation_client = self.generation_client.clone();
         let _directory = self.directory.clone();
         let generation_url = self.generation_url.clone();
 
@@ -700,8 +820,6 @@ impl Service<Request<Incoming>> for StreamServer {
                         .body(body_from_string(response_json.to_string())).unwrap())
                 },
                 (&Method::POST, "/v1/chat/completions") => {
-                    println!("📡 Received POST request to /api/stream");
-                    
                     let body_bytes = match req.into_body().collect().await {
                         Ok(collected) => collected.to_bytes(),
                         Err(e) => {
@@ -712,17 +830,10 @@ impl Service<Request<Incoming>> for StreamServer {
                         }
                     };
                     
-                    println!("📄 Request body size: {} bytes", body_bytes.len());
-                    
                     let stream_req: StreamRequest = match serde_json::from_slice::<StreamRequest>(&body_bytes) {
-                        Ok(req) => {
-                            println!("✅ Successfully parsed StreamRequest");
-                            println!("💬 Message count: {}", req.messages.len());
-                            req
-                        },
+                        Ok(req) => req,
                         Err(e) => {
                             println!("❌ Failed to parse JSON: {:?}", e);
-                            println!("📄 Raw body: {}", String::from_utf8_lossy(&body_bytes));
                             return Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
                                 .body(body_from_string("Invalid JSON".to_string())).unwrap());
@@ -737,71 +848,43 @@ impl Service<Request<Incoming>> for StreamServer {
                         .map(|msg| msg.content.as_str())
                         .unwrap_or("");
                     
-                    println!("🔍 Extracted user message: '{}'", user_message);
-                    
                     if user_message.is_empty() {
-                        println!("❌ No user message found in request");
                         return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
                             .body(body_from_string("No user message found".to_string())).unwrap());
                     }
                     
-                    // Get relevant context from knowledge base
-                    println!("🧠 Searching knowledge base for context...");
-                    let context = if let Some(client) = &embedding_client {
-                        println!("🔤 Generating embedding for user message...");
-                        match {
-                            let mut client_guard = client.lock().await;
-                            generate_embedding(&mut *client_guard, user_message).await
-                        } {
-                            Ok(query_embedding) => {
-                                println!("✅ Embedding generated, searching for similar chunks...");
-                                let chunks_guard = chunks.lock().await;
-                                let similar_chunks = find_similar_chunks(&query_embedding, &chunks_guard, 3).await;
-                                println!("📚 Found {} similar chunks", similar_chunks.len());
+                    // Two-phase approach: Generate search questions, then search knowledge base
+                    let mut augmented_messages = stream_req.messages.clone();
+                    
+                    // Phase 1: Generate search questions if we have a generation client
+                    if let Some(gen_client) = &generation_client {
+                        match generate_search_questions(gen_client, &stream_req.messages).await {
+                            Ok(questions) => {
                                 
-                                let mut context_str = String::new();
-                                for (i, (similarity, chunk)) in similar_chunks.iter().enumerate() {
-                                    println!("  {}. Similarity: {:.3}, Source: {}", i + 1, similarity, chunk.source_file);
-                                    context_str.push_str(&format!(
-                                        "Context (Similarity: {:.3}) - From: {}\n{}\n\n",
-                                        similarity,
-                                        chunk.source_file,
-                                        chunk.content
-                                    ));
+                                // Phase 2: Search knowledge base for these questions
+                                if !questions.is_empty() {
+                                    let chunks_guard = chunks.lock().await;
+                                    match search_knowledge_base_for_questions(&questions, &embedding_client, &chunks_guard).await {
+                                        Ok(context) => {
+                                            if !context.is_empty() {
+                                                // Add tool role message with the retrieved context
+                                                augmented_messages.push(Message {
+                                                    role: "tool".to_string(),
+                                                    content: context,
+                                                });
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!("❌ Failed to search knowledge base: {:?}", e);
+                                        }
+                                    }
                                 }
-                                context_str
                             }
                             Err(e) => {
-                                println!("❌ Failed to generate embedding: {:?}", e);
-                                String::new()
-                            },
+                                println!("❌ Failed to generate search questions: {:?}", e);
+                            }
                         }
-                    } else {
-                        println!("⚠️  No embedding client available, skipping context search");
-                        String::new()
-                    };
-                    
-                    // Augment the system message or last message with context if available
-                    let mut augmented_messages = stream_req.messages.clone();
-                    if !context.is_empty() {
-                        println!("📝 Augmenting messages with knowledge base context");
-                        // Find system message and augment it, or create one
-                        let system_augmentation = format!("\n\nRelevant context from knowledge base:\n{}", context);
-                        
-                        if let Some(system_msg) = augmented_messages.iter_mut().find(|msg| msg.role == "system") {
-                            println!("🔧 Augmenting existing system message");
-                            system_msg.content.push_str(&system_augmentation);
-                        } else {
-                            println!("➕ Creating new system message with context");
-                            // Insert system message at the beginning
-                            augmented_messages.insert(0, Message {
-                                role: "system".to_string(),
-                                content: format!("You are a helpful assistant. Use the following context to help answer questions:{}", system_augmentation),
-                            });
-                        }
-                    } else {
-                        println!("⚠️  No context found, proceeding without augmentation");
                     }
                     
                     // Use the generation URL from CLI args and ensure it ends with /v1/chat/completions
@@ -828,18 +911,12 @@ impl Service<Request<Incoming>> for StreamServer {
                         }
                     };
                     
-                    println!("🚀 Proxying to generation endpoint: {}", target_url);
-                    
                     // Prepare the request payload
                     let forward_payload = serde_json::json!({
                         "model": stream_req.model.unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
                         "messages": augmented_messages,
                         "stream": stream_req.stream
                     });
-                    
-                    println!("📤 Sending {} request with {} messages", 
-                             if stream_req.stream { "streaming" } else { "non-streaming" },
-                             augmented_messages.len());
                     
                     // Make the HTTP request
                     let client = reqwest::Client::new();
@@ -853,14 +930,12 @@ impl Service<Request<Incoming>> for StreamServer {
                     {
                         Ok(response) => {
                             let status = response.status();
-                            println!("📥 Received response with status: {}", status);
                             
                             // Convert reqwest status to hyper status
                             let hyper_status = StatusCode::from_u16(status.as_u16())
                                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                             
                             if stream_req.stream {
-                                println!("🌊 Setting up TRUE streaming response");
                                 
                                 // Create a stream from the response body that forwards chunks as they arrive
                                 use futures::stream::TryStreamExt;
@@ -877,7 +952,6 @@ impl Service<Request<Incoming>> for StreamServer {
                                 
                                 let body = BodyExt::boxed(StreamBody::new(stream));
                                 
-                                println!("✅ Starting TRUE streaming response");
                                 Ok(Response::builder()
                                     .status(hyper_status)
                                     .header("content-type", "text/event-stream")
@@ -889,9 +963,7 @@ impl Service<Request<Incoming>> for StreamServer {
                             } else {
                                 // Non-streaming: get the full response body
                                 let body_bytes = response.bytes().await.unwrap_or_default();
-                                println!("📄 Response body size: {} bytes", body_bytes.len());
                                 
-                                println!("✅ Forwarding non-streaming response");
                                 Ok(Response::builder()
                                     .status(hyper_status)
                                     .header("content-type", "application/json")
@@ -1058,7 +1130,7 @@ async fn main() -> anyhow::Result<()> {
         println!("   Available endpoints:");
         println!("     GET  / - Search interface");
         println!("     POST /search - Search knowledge base");
-        println!("     POST /api/stream - Streaming endpoint with knowledge augmentation");
+        println!("     POST /v1/chat/completion - Streaming endpoint with knowledge augmentation");
 
         let stream_service = StreamServer {
             chunks: chunks_arc.clone(),

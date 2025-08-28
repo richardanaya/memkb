@@ -1,27 +1,37 @@
-
 use clap::Parser;
+use futures::future::{BoxFuture, FutureExt};
+use hyper::{
+    Method, Request, Response, StatusCode,
+    body::{Bytes, Frame, Incoming},
+    service::Service,
+};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
-use hyper::{body::{Incoming, Bytes}, service::Service, Request, Response, Method, StatusCode};
-use futures::future::{BoxFuture, FutureExt};
-use http_body_util::{BodyExt, Full};
+// StreamExt imported locally where needed
+use http_body_util::{BodyExt, Full, StreamBody};
+use openai_api_rs::v1::{
+    api::OpenAIClient,
+    chat_completion::{self, ChatCompletionMessage, ChatCompletionRequest, MessageRole},
+    embedding::{EmbeddingRequest, EncodingFormat},
+};
+use rmcp::handler::server::tool::Parameters;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager,
 };
-use openai_api_rs::v1::{api::OpenAIClient, chat_completion::{self, ChatCompletionMessage, ChatCompletionRequest, MessageRole}, embedding::{EmbeddingRequest, EncodingFormat}};
-use rmcp::{ErrorData as McpError, model::*, tool, tool_router,tool_handler, handler::server::router::tool::ToolRouter};
-use serde::{Deserialize, Serialize};
+use rmcp::{
+    ErrorData as McpError, handler::server::router::tool::ToolRouter, model::*, tool, tool_handler,
+    tool_router,
+};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use simsimd::SpatialSimilarity;
 use std::{fs, io::Write, sync::Arc};
 use text_splitter::{ChunkConfig, MarkdownSplitter};
 use tokio::sync::Mutex;
 use walkdir::WalkDir;
-use rmcp::handler::server::tool::Parameters;
-
 
 #[derive(Parser)]
 #[command(name = "memkb")]
@@ -29,25 +39,25 @@ use rmcp::handler::server::tool::Parameters;
 struct Args {
     #[arg(short, long, default_value = "8080")]
     port: u16,
-    
+
     #[arg(short = 'H', long, default_value = "localhost")]
     host: String,
-    
+
     #[arg(short, long, default_value = ".")]
     directory: String,
-    
+
     #[arg(short, long)]
     embedding_url: Option<String>,
-    
+
     #[arg(short, long)]
     generation_url: Option<String>,
-    
+
     #[arg(short = 'c', long, default_value = "1000")]
     chunk_size: usize,
-    
+
     #[arg(short = 'o', long, default_value = "200")]
     overlap: usize,
-    
+
     #[arg(long)]
     http: bool,
 }
@@ -67,7 +77,7 @@ struct Message {
 struct StreamRequest {
     model: Option<String>,
     messages: Vec<Message>,
-    stream: bool
+    stream: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -87,7 +97,11 @@ pub struct MemoryKB {
 
 #[tool_router]
 impl MemoryKB {
-    fn new(directory: String, embedding_client: Option<Arc<Mutex<OpenAIClient>>>, generation_client: Option<Arc<Mutex<OpenAIClient>>>) -> Self {
+    fn new(
+        directory: String,
+        embedding_client: Option<Arc<Mutex<OpenAIClient>>>,
+        generation_client: Option<Arc<Mutex<OpenAIClient>>>,
+    ) -> Self {
         Self {
             directory,
             chunks: Arc::new(Mutex::new(Vec::new())),
@@ -97,10 +111,13 @@ impl MemoryKB {
         }
     }
 
-    #[tool(name = "ask_question", description = "Ask a question of the knowledge base")]
+    #[tool(
+        name = "ask_question",
+        description = "Ask a question of the knowledge base"
+    )]
     async fn ask(&self, params: Parameters<AskRequest>) -> Result<CallToolResult, McpError> {
         let prompt = &params.0.prompt;
-        
+
         // If no embedding client, fall back to returning all content
         if self.embedding_client.is_none() {
             let merged_content = match read_and_merge_markdown_files(&self.directory) {
@@ -111,24 +128,31 @@ impl MemoryKB {
                     )]));
                 }
             };
-            
+
             // Try to generate answer with all content if generation client is available
             if let Some(gen_client) = &self.generation_client {
                 match generate_answer(gen_client, prompt, &merged_content).await {
                     Ok(answer) => {
-                        return Ok(CallToolResult::success(vec![rmcp::model::Content::text(answer)]));
+                        return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                            answer,
+                        )]));
                     }
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                            format!("Error generating answer: {}. Returning raw content:\n\n{}", e, merged_content),
+                            format!(
+                                "Error generating answer: {}. Returning raw content:\n\n{}",
+                                e, merged_content
+                            ),
                         )]));
                     }
                 }
             } else {
-                return Ok(CallToolResult::success(vec![rmcp::model::Content::text(merged_content)]));
+                return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                    merged_content,
+                )]));
             }
         }
-        
+
         // Generate embedding for the query
         let query_embedding = match &self.embedding_client {
             Some(client) => {
@@ -141,24 +165,24 @@ impl MemoryKB {
                         )]));
                     }
                 }
-            },
+            }
             None => {
                 return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
                     "No embedding client available".to_string(),
                 )]));
             }
         };
-        
+
         // Find similar chunks
         let chunks = self.chunks.lock().await;
         let similar_chunks = find_similar_chunks(&query_embedding, &chunks, 5).await;
-        
+
         if similar_chunks.is_empty() {
             return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
                 "No relevant content found.".to_string(),
             )]));
         }
-        
+
         // Collect relevant content for context
         let mut context = String::new();
         for (i, (similarity, chunk)) in similar_chunks.iter().enumerate() {
@@ -170,26 +194,34 @@ impl MemoryKB {
                 chunk.content
             ));
         }
-        
+
         // Generate answer using the context
         if let Some(gen_client) = &self.generation_client {
             match generate_answer(gen_client, prompt, &context).await {
-                Ok(answer) => {
-                    Ok(CallToolResult::success(vec![rmcp::model::Content::text(answer)]))
-                }
+                Ok(answer) => Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                    answer,
+                )])),
                 Err(e) => {
                     // Fall back to returning chunks if generation fails
                     let fallback_response = format!(
                         "Error generating answer: {}. Here are the relevant chunks:\n\n{}",
                         e, context
                     );
-                    Ok(CallToolResult::success(vec![rmcp::model::Content::text(fallback_response)]))
+                    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                        fallback_response,
+                    )]))
                 }
             }
         } else {
             // No generation client, return formatted chunks
-            let response = format!("Top {} relevant chunks for your query:\n\n{}", similar_chunks.len(), context);
-            Ok(CallToolResult::success(vec![rmcp::model::Content::text(response)]))
+            let response = format!(
+                "Top {} relevant chunks for your query:\n\n{}",
+                similar_chunks.len(),
+                context
+            );
+            Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                response,
+            )]))
         }
     }
 }
@@ -199,7 +231,9 @@ impl MemoryKB {
 impl rmcp::ServerHandler for MemoryKB {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            instructions: Some("Memory knowledge base server - ask questions about markdown content".into()),
+            instructions: Some(
+                "Memory knowledge base server - ask questions about markdown content".into(),
+            ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
@@ -208,16 +242,17 @@ impl rmcp::ServerHandler for MemoryKB {
 
 async fn test_embedding_server(url: &str) -> anyhow::Result<()> {
     let mut client = OpenAIClient::builder()
-    .with_endpoint(url)
-    .with_api_key("test")
-    .build().unwrap();
-    
+        .with_endpoint(url)
+        .with_api_key("test")
+        .build()
+        .unwrap();
+
     let mut req = EmbeddingRequest::new(
         "text-embedding-3-small".to_string(),
         vec!["Hello, this is a test embedding".to_string()],
     );
     req.encoding_format = Some(EncodingFormat::Float);
-    
+
     match client.embedding(req).await {
         Ok(_) => {
             println!("✅ Embedding server test: PASSED");
@@ -231,22 +266,23 @@ async fn test_embedding_server(url: &str) -> anyhow::Result<()> {
 }
 
 async fn test_generation_server(url: &str) -> anyhow::Result<()> {
-     let mut client = OpenAIClient::builder()
-    .with_endpoint(url)
-    .with_api_key("test")
-    .build().unwrap();
-    
+    let mut client = OpenAIClient::builder()
+        .with_endpoint(url)
+        .with_api_key("test")
+        .build()
+        .unwrap();
+
     let req = ChatCompletionRequest::new(
-    "Generate".to_string(),
-    vec![ChatCompletionMessage {
-        role: MessageRole::user,
-        content: chat_completion::Content::Text("hey".to_string()),
-        name: None,
-        tool_calls: None,
-        tool_call_id: None,
-    }],
-);
-    
+        "Generate".to_string(),
+        vec![ChatCompletionMessage {
+            role: MessageRole::user,
+            content: chat_completion::Content::Text("hey".to_string()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+    );
+
     match client.chat_completion(req).await {
         Ok(_) => {
             println!("✅ Generation server test: PASSED");
@@ -261,7 +297,7 @@ async fn test_generation_server(url: &str) -> anyhow::Result<()> {
 
 fn scan_directory_for_md_files(dir_path: &str) -> anyhow::Result<(Vec<String>, usize)> {
     let mut md_files = Vec::new();
-    
+
     for entry in WalkDir::new(dir_path) {
         let entry = entry?;
         if entry.file_type().is_file() {
@@ -274,14 +310,14 @@ fn scan_directory_for_md_files(dir_path: &str) -> anyhow::Result<(Vec<String>, u
             }
         }
     }
-    
+
     let count = md_files.len();
     Ok((md_files, count))
 }
 
 fn read_and_merge_markdown_files(dir_path: &str) -> anyhow::Result<String> {
     let mut merged_content = String::new();
-    
+
     for entry in WalkDir::new(dir_path) {
         let entry = entry?;
         if entry.file_type().is_file() {
@@ -289,7 +325,7 @@ fn read_and_merge_markdown_files(dir_path: &str) -> anyhow::Result<String> {
                 if extension == "md" {
                     let file_path = entry.path();
                     let content = fs::read_to_string(file_path)?;
-                    
+
                     merged_content.push_str(&format!("\n\n# File: {}\n\n", file_path.display()));
                     merged_content.push_str(&content);
                     merged_content.push_str("\n\n---\n");
@@ -297,7 +333,7 @@ fn read_and_merge_markdown_files(dir_path: &str) -> anyhow::Result<String> {
             }
         }
     }
-    
+
     Ok(merged_content)
 }
 
@@ -305,7 +341,7 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
     // Create a text splitter with specified chunk size and overlap
     let cfg = ChunkConfig::new(chunk_size).with_overlap(overlap).unwrap();
     let splitter = MarkdownSplitter::new(cfg);
-    
+
     // For now, just use basic splitting. We can enhance with overlap later
     splitter.chunks(text).map(|s| s.to_string()).collect()
 }
@@ -317,7 +353,7 @@ async fn chunk_and_embed_files(
     overlap: usize,
 ) -> anyhow::Result<Vec<TextChunk>> {
     let mut chunks = Vec::new();
-    
+
     // First pass: collect all chunks without embeddings
     for entry in WalkDir::new(dir_path) {
         let entry = entry?;
@@ -327,10 +363,10 @@ async fn chunk_and_embed_files(
                     let file_path = entry.path();
                     let content = fs::read_to_string(file_path)?;
                     let source_file = file_path.to_string_lossy().to_string();
-                    
+
                     // Chunk the content with configurable size and overlap
                     let text_chunks = chunk_text(&content, chunk_size, overlap);
-                    
+
                     for chunk_content in text_chunks {
                         let chunk = TextChunk {
                             content: chunk_content,
@@ -343,44 +379,48 @@ async fn chunk_and_embed_files(
             }
         }
     }
-    
+
     // Second pass: generate embeddings with progress counter
     if let Some(client) = embedding_client {
         let total_chunks = chunks.len();
         println!("📊 Generating embeddings for {} chunks...", total_chunks);
-        
+
         for (i, chunk) in chunks.iter_mut().enumerate() {
             let progress = i + 1;
-            print!("\r🔄 Embedding chunk {}/{} ({:.1}%)", 
-                   progress, total_chunks, 
-                   (progress as f32 / total_chunks as f32) * 100.0);
+            print!(
+                "\r🔄 Embedding chunk {}/{} ({:.1}%)",
+                progress,
+                total_chunks,
+                (progress as f32 / total_chunks as f32) * 100.0
+            );
             std::io::stdout().flush().unwrap();
-            
+
             let mut client_guard = client.lock().await;
             match generate_embedding(&mut *client_guard, &chunk.content).await {
                 Ok(embedding) => {
                     chunk.embedding = Some(embedding);
                 }
                 Err(e) => {
-                    println!("\n⚠️  Failed to embed chunk from {}: {}", chunk.source_file, e);
+                    println!(
+                        "\n⚠️  Failed to embed chunk from {}: {}",
+                        chunk.source_file, e
+                    );
                 }
             }
         }
         println!(); // New line after progress counter
     }
-    
+
     Ok(chunks)
 }
 
 async fn generate_embedding(client: &mut OpenAIClient, text: &str) -> anyhow::Result<Vec<f32>> {
-    let mut req = EmbeddingRequest::new(
-        "text-embedding-3-small".to_string(),
-        vec![text.to_string()],
-    );
+    let mut req =
+        EmbeddingRequest::new("text-embedding-3-small".to_string(), vec![text.to_string()]);
     req.encoding_format = Some(EncodingFormat::Float);
-    
+
     let response = client.embedding(req).await?;
-    
+
     if let Some(embedding_data) = response.data.first() {
         Ok(embedding_data.embedding.clone())
     } else {
@@ -388,16 +428,20 @@ async fn generate_embedding(client: &mut OpenAIClient, text: &str) -> anyhow::Re
     }
 }
 
-async fn generate_answer(client: &Arc<Mutex<OpenAIClient>>, question: &str, context: &str) -> anyhow::Result<String> {
+async fn generate_answer(
+    client: &Arc<Mutex<OpenAIClient>>,
+    question: &str,
+    context: &str,
+) -> anyhow::Result<String> {
     let mut client_guard = client.lock().await;
-    
+
     let system_prompt = "You are a helpful assistant that answers questions based on the provided context. If the context doesn't contain relevant information to answer the question, respond with \"We don't have any information on that question\". Always base your answer strictly on the provided context and be concise.";
-    
+
     let user_prompt = format!(
         "Context:\n{}\n\nQuestion: {}\n\nPlease provide a helpful answer based on the context above.",
         context, question
     );
-    
+
     let req = ChatCompletionRequest::new(
         "gpt-3.5-turbo".to_string(),
         vec![
@@ -417,9 +461,9 @@ async fn generate_answer(client: &Arc<Mutex<OpenAIClient>>, question: &str, cont
             },
         ],
     );
-    
+
     let response = client_guard.chat_completion(req).await?;
-    
+
     if let Some(choice) = response.choices.first() {
         if let Some(content) = &choice.message.content {
             Ok(content.to_string())
@@ -453,12 +497,30 @@ async fn find_similar_chunks<'a>(
             })
         })
         .collect();
-    
+
     // Sort by similarity (highest first)
     similarities.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    
+
     // Return top k results
     similarities.into_iter().take(top_k).collect()
+}
+
+// Helper function to create a boxed body from a string
+fn body_from_string(
+    s: String,
+) -> http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    Full::from(s)
+        .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+        .boxed()
+}
+
+// Helper function to create a boxed body from bytes
+fn body_from_bytes(
+    b: Bytes,
+) -> http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    Full::from(b)
+        .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+        .boxed()
 }
 
 #[derive(Clone)]
@@ -467,19 +529,23 @@ struct StreamServer {
     embedding_client: Option<Arc<Mutex<OpenAIClient>>>,
     generation_client: Option<Arc<Mutex<OpenAIClient>>>,
     directory: String,
+    generation_url: Option<String>,
 }
 
 impl Service<Request<Incoming>> for StreamServer {
-    type Response = Response<Full<Bytes>>;
+    type Response = Response<
+        http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
+    >;
     type Error = hyper::Error;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let chunks = self.chunks.clone();
         let embedding_client = self.embedding_client.clone();
-        let generation_client = self.generation_client.clone();
+        let _generation_client = self.generation_client.clone();
         let _directory = self.directory.clone();
-        
+        let generation_url = self.generation_url.clone();
+
         async move {
             match (req.method(), req.uri().path()) {
                 (&Method::GET, "/") => {
@@ -556,7 +622,7 @@ impl Service<Request<Incoming>> for StreamServer {
 "#;
                     Ok(Response::builder()
                         .header("content-type", "text/html")
-                        .body(Full::from(html)).unwrap())
+                        .body(body_from_string(html.to_string())).unwrap())
                 },
                 (&Method::POST, "/search") => {
                     let body_bytes = match req.into_body().collect().await {
@@ -564,7 +630,7 @@ impl Service<Request<Incoming>> for StreamServer {
                         Err(_) => {
                             return Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
-                                .body(Full::from("Invalid request body")).unwrap());
+                                .body(body_from_string("Invalid request body".to_string())).unwrap());
                         }
                     };
                     
@@ -573,7 +639,7 @@ impl Service<Request<Incoming>> for StreamServer {
                         Err(_) => {
                             return Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
-                                .body(Full::from("Invalid JSON")).unwrap());
+                                .body(body_from_string("Invalid JSON".to_string())).unwrap());
                         }
                     };
                     
@@ -582,7 +648,7 @@ impl Service<Request<Incoming>> for StreamServer {
                         None => {
                             return Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
-                                .body(Full::from("Missing query field")).unwrap());
+                                .body(body_from_string("Missing query field".to_string())).unwrap());
                         }
                     };
                     
@@ -631,7 +697,7 @@ impl Service<Request<Incoming>> for StreamServer {
                     
                     Ok(Response::builder()
                         .header("content-type", "application/json")
-                        .body(Full::from(response_json.to_string())).unwrap())
+                        .body(body_from_string(response_json.to_string())).unwrap())
                 },
                 (&Method::POST, "/v1/chat/completions") => {
                     println!("📡 Received POST request to /api/stream");
@@ -642,7 +708,7 @@ impl Service<Request<Incoming>> for StreamServer {
                             println!("❌ Failed to read request body: {:?}", e);
                             return Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
-                                .body(Full::from("Invalid request body")).unwrap());
+                                .body(body_from_string("Invalid request body".to_string())).unwrap());
                         }
                     };
                     
@@ -659,7 +725,7 @@ impl Service<Request<Incoming>> for StreamServer {
                             println!("📄 Raw body: {}", String::from_utf8_lossy(&body_bytes));
                             return Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
-                                .body(Full::from("Invalid JSON")).unwrap());
+                                .body(body_from_string("Invalid JSON".to_string())).unwrap());
                         }
                     };
                     
@@ -677,7 +743,7 @@ impl Service<Request<Incoming>> for StreamServer {
                         println!("❌ No user message found in request");
                         return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
-                            .body(Full::from("No user message found")).unwrap());
+                            .body(body_from_string("No user message found".to_string())).unwrap());
                     }
                     
                     // Get relevant context from knowledge base
@@ -738,133 +804,114 @@ impl Service<Request<Incoming>> for StreamServer {
                         println!("⚠️  No context found, proceeding without augmentation");
                     }
                     
-                    // Use the OpenAI generation client
-                    match &generation_client {
-                        Some(client) => {
-                            println!("🚀 Using OpenAI generation client");
-                            
-                            // Convert messages to OpenAI format
-                            let mut openai_messages = Vec::new();
-                            for msg in augmented_messages {
-                                let role = match msg.role.as_str() {
-                                    "system" => MessageRole::system,
-                                    "user" => MessageRole::user,
-                                    "assistant" => MessageRole::assistant,
-                                    _ => MessageRole::user,
-                                };
-                                
-                                openai_messages.push(ChatCompletionMessage {
-                                    role,
-                                    content: chat_completion::Content::Text(msg.content),
-                                    name: None,
-                                    tool_calls: None,
-                                    tool_call_id: None,
-                                });
+                    // Use the generation URL from CLI args and ensure it ends with /v1/chat/completions
+                    let target_url = match &generation_url {
+                        Some(url) => {
+                            let mut final_url = url.clone();
+                            // Ensure the URL ends with the correct endpoint
+                            if !final_url.ends_with("/v1/chat/completions") {
+                                if final_url.ends_with("/") {
+                                    final_url.push_str("v1/chat/completions");
+                                } else if final_url.ends_with("/v1") {
+                                    final_url.push_str("/chat/completions");
+                                } else {
+                                    final_url.push_str("/v1/chat/completions");
+                                }
                             }
+                            final_url
+                        },
+                        None => {
+                            println!("❌ No generation URL configured");
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(body_from_string("No generation URL configured".to_string())).unwrap());
+                        }
+                    };
+                    
+                    println!("🚀 Proxying to generation endpoint: {}", target_url);
+                    
+                    // Prepare the request payload
+                    let forward_payload = serde_json::json!({
+                        "model": stream_req.model.unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
+                        "messages": augmented_messages,
+                        "stream": stream_req.stream
+                    });
+                    
+                    println!("📤 Sending {} request with {} messages", 
+                             if stream_req.stream { "streaming" } else { "non-streaming" },
+                             augmented_messages.len());
+                    
+                    // Make the HTTP request
+                    let client = reqwest::Client::new();
+                    match client
+                        .post(&target_url)
+                        .header("Content-Type", "application/json")
+                        .header("Accept", if stream_req.stream { "text/event-stream" } else { "application/json" })
+                        .json(&forward_payload)
+                        .send()
+                        .await
+                    {
+                        Ok(response) => {
+                            let status = response.status();
+                            println!("📥 Received response with status: {}", status);
                             
-                            let chat_request = ChatCompletionRequest::new(
-                                "gpt-3.5-turbo".to_string(),
-                                openai_messages,
-                            );
+                            // Convert reqwest status to hyper status
+                            let hyper_status = StatusCode::from_u16(status.as_u16())
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                             
-                            println!("📤 Sending chat completion request with {} messages", chat_request.messages.len());
-                            
-                            match {
-                                let mut client_guard = client.lock().await;
-                                client_guard.chat_completion(chat_request).await
-                            } {
-                                Ok(response) => {
-                                    println!("✅ Received successful response from generation client");
-                                    
-                                    if let Some(choice) = response.choices.first() {
-                                        if let Some(content) = &choice.message.content {
-                                            if stream_req.stream {
-                                                println!("🌊 Streaming response requested, simulating token stream");
-                                                // Create streaming response
-                                                let words: Vec<&str> = content.split_whitespace().collect();
-                                                let mut sse_response = String::new();
-                                                
-                                                // Send each word as a separate chunk
-                                                for (i, word) in words.iter().enumerate() {
-                                                    let chunk_data = serde_json::json!({
-                                                        "choices": [{
-                                                            "delta": {
-                                                                "content": if i == 0 { word.to_string() } else { format!(" {}", word) }
-                                                            },
-                                                            "index": 0,
-                                                            "finish_reason": null
-                                                        }]
-                                                    });
-                                                    
-                                                    sse_response.push_str(&format!("data: {}\n\n", chunk_data));
-                                                }
-                                                
-                                                // Send final chunk with finish_reason
-                                                let final_chunk = serde_json::json!({
-                                                    "choices": [{
-                                                        "delta": {},
-                                                        "index": 0,
-                                                        "finish_reason": "stop"
-                                                    }]
-                                                });
-                                                sse_response.push_str(&format!("data: {}\n\n", final_chunk));
-                                                sse_response.push_str("data: [DONE]\n\n");
-                                                
-                                                Ok(Response::builder()
-                                                    .header("content-type", "text/event-stream")
-                                                    .header("cache-control", "no-cache")
-                                                    .header("connection", "keep-alive")
-                                                    .body(Full::from(sse_response)).unwrap())
-                                            } else {
-                                                println!("📄 Non-streaming response requested");
-                                                let response_json = serde_json::json!({
-                                                    "choices": [{
-                                                        "message": {
-                                                            "role": "assistant",
-                                                            "content": content
-                                                        },
-                                                        "finish_reason": choice.finish_reason
-                                                    }],
-                                                    "usage": response.usage
-                                                });
-                                                
-                                                Ok(Response::builder()
-                                                    .header("content-type", "application/json")
-                                                    .body(Full::from(response_json.to_string())).unwrap())
-                                            }
-                                        } else {
-                                            println!("❌ No content in response message");
-                                            Ok(Response::builder()
-                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                .body(Full::from("No content in response")).unwrap())
-                                        }
-                                    } else {
-                                        println!("❌ No choices in response");
-                                        Ok(Response::builder()
-                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                            .body(Full::from("No choices in response")).unwrap())
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("❌ Generation client error: {:?}", e);
-                                    Ok(Response::builder()
-                                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                        .body(Full::from(format!("Generation error: {}", e))).unwrap())
-                                }
+                            if stream_req.stream {
+                                println!("🌊 Setting up TRUE streaming response");
+                                
+                                // Create a stream from the response body that forwards chunks as they arrive
+                                use futures::stream::TryStreamExt;
+                                let stream = response.bytes_stream()
+                                    .map_ok(|bytes| {
+                                        Frame::data(bytes)
+                                    })
+                                    .map_err(|e| {
+                                        eprintln!("Stream error: {:?}", e);
+                                        // Create a hyper error - hyper::Error doesn't have From<io::Error>
+                                        // so we need to find another way
+                                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Stream error: {}", e))) as Box<dyn std::error::Error + Send + Sync>
+                                    });
+                                
+                                let body = BodyExt::boxed(StreamBody::new(stream));
+                                
+                                println!("✅ Starting TRUE streaming response");
+                                Ok(Response::builder()
+                                    .status(hyper_status)
+                                    .header("content-type", "text/event-stream")
+                                    .header("cache-control", "no-cache")
+                                    .header("connection", "keep-alive")
+                                    .header("access-control-allow-origin", "*")
+                                    .body(body)
+                                    .unwrap())
+                            } else {
+                                // Non-streaming: get the full response body
+                                let body_bytes = response.bytes().await.unwrap_or_default();
+                                println!("📄 Response body size: {} bytes", body_bytes.len());
+                                
+                                println!("✅ Forwarding non-streaming response");
+                                Ok(Response::builder()
+                                    .status(hyper_status)
+                                    .header("content-type", "application/json")
+                                    .body(body_from_bytes(body_bytes))
+                                    .unwrap())
                             }
                         }
-                        None => {
-                            println!("❌ No generation client configured");
+                        Err(e) => {
+                            println!("❌ Failed to connect to generation endpoint: {:?}", e);
                             Ok(Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(Full::from("No generation client configured")).unwrap())
+                                .status(StatusCode::BAD_GATEWAY)
+                                .body(body_from_string(format!("Failed to connect to generation endpoint: {}", e)))
+                                .unwrap())
                         }
                     }
                 },
                 _ => {
                     Ok(Response::builder()
                         .status(StatusCode::NOT_FOUND)
-                        .body(Full::from("Not Found")).unwrap())
+                        .body(body_from_string("Not Found".to_string())).unwrap())
                 }
             }
         }.boxed()
@@ -874,11 +921,11 @@ impl Service<Request<Incoming>> for StreamServer {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    
+
     println!("🚀 Starting memkb MCP server");
     println!("📍 Server running on: http://{}:{}", args.host, args.port);
     println!("📁 Target directory: {}", args.directory);
-    
+
     println!("🔍 Scanning directory for .md files...");
     match scan_directory_for_md_files(&args.directory) {
         Ok((md_files, count)) => {
@@ -894,7 +941,7 @@ async fn main() -> anyhow::Result<()> {
             println!("❌ Error scanning directory: {}", e);
         }
     }
-    
+
     if let Some(embedding_url) = &args.embedding_url {
         println!("🧠 Embedding server: {}", embedding_url);
         println!("🔍 Testing embedding server...");
@@ -904,7 +951,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         println!("🧠 Embedding server: Not configured");
     }
-    
+
     if let Some(generation_url) = &args.generation_url {
         println!("✨ Generation server: {}", generation_url);
         println!("🔍 Testing generation server...");
@@ -914,34 +961,57 @@ async fn main() -> anyhow::Result<()> {
     } else {
         println!("✨ Generation server: Not configured");
     }
-    
+
     // Initialize embedding client if URL provided
     let embedding_client = if let Some(embedding_url) = &args.embedding_url {
-        Some(Arc::new(Mutex::new(OpenAIClient::builder()
-            .with_endpoint(embedding_url)
-            .with_api_key("test")
-            .build().unwrap())))
+        Some(Arc::new(Mutex::new(
+            OpenAIClient::builder()
+                .with_endpoint(embedding_url)
+                .with_api_key("test")
+                .build()
+                .unwrap(),
+        )))
     } else {
         None
     };
-    
+
     // Initialize generation client if URL provided
     let generation_client = if let Some(generation_url) = &args.generation_url {
-        Some(Arc::new(Mutex::new(OpenAIClient::builder()
-            .with_endpoint(generation_url)
-            .with_api_key("test")
-            .build().unwrap())))
+        Some(Arc::new(Mutex::new(
+            OpenAIClient::builder()
+                .with_endpoint(generation_url)
+                .with_api_key("test")
+                .build()
+                .unwrap(),
+        )))
     } else {
         None
     };
-    
+
     // Process and embed all markdown files
     println!("🧠 Processing and embedding markdown files...");
-    println!("📏 Chunk size: {} characters, Overlap: {} characters", args.chunk_size, args.overlap);
-    let chunks = match chunk_and_embed_files(&args.directory, &embedding_client, args.chunk_size, args.overlap).await {
+    println!(
+        "📏 Chunk size: {} characters, Overlap: {} characters",
+        args.chunk_size, args.overlap
+    );
+    let chunks = match chunk_and_embed_files(
+        &args.directory,
+        &embedding_client,
+        args.chunk_size,
+        args.overlap,
+    )
+    .await
+    {
         Ok(chunks) => {
-            let embedded_count = chunks.iter().filter(|chunk| chunk.embedding.is_some()).count();
-            println!("✅ Successfully processed {} chunks ({} embedded)", chunks.len(), embedded_count);
+            let embedded_count = chunks
+                .iter()
+                .filter(|chunk| chunk.embedding.is_some())
+                .count();
+            println!(
+                "✅ Successfully processed {} chunks ({} embedded)",
+                chunks.len(),
+                embedded_count
+            );
             chunks
         }
         Err(e) => {
@@ -949,16 +1019,16 @@ async fn main() -> anyhow::Result<()> {
             Vec::new()
         }
     };
-    
+
     println!("Press Ctrl+C to stop the server");
     println!();
-    
+
     let bind_addr = format!("{}:{}", args.host, args.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    
+
     // Prepare shared chunks
     let chunks_arc = Arc::new(Mutex::new(chunks));
-    
+
     // Start MCP server
     let directory = args.directory.clone();
     let mcp_chunks_arc = chunks_arc.clone();
@@ -966,33 +1036,38 @@ async fn main() -> anyhow::Result<()> {
     let generation_client_arc = generation_client.clone();
     let mcp_service = TowerToHyperService::new(StreamableHttpService::new(
         move || {
-            let mut kb = MemoryKB::new(directory.clone(), embedding_client_arc.clone(), generation_client_arc.clone());
+            let mut kb = MemoryKB::new(
+                directory.clone(),
+                embedding_client_arc.clone(),
+                generation_client_arc.clone(),
+            );
             kb.chunks = mcp_chunks_arc.clone();
             Ok(kb)
         },
         LocalSessionManager::default().into(),
         Default::default(),
     ));
-    
+
     if args.http {
         // Start additional HTTP server on port + 1
         let http_port = args.port + 1;
         let http_bind_addr = format!("{}:{}", args.host, http_port);
         let http_listener = tokio::net::TcpListener::bind(&http_bind_addr).await?;
-        
+
         println!("🌐 Starting HTTP server at http://{}", http_bind_addr);
         println!("   Available endpoints:");
         println!("     GET  / - Search interface");
-        println!("     POST /search - Search knowledge base"); 
+        println!("     POST /search - Search knowledge base");
         println!("     POST /api/stream - Streaming endpoint with knowledge augmentation");
-        
+
         let stream_service = StreamServer {
             chunks: chunks_arc.clone(),
             embedding_client: embedding_client.clone(),
             generation_client: generation_client.clone(),
             directory: args.directory.clone(),
+            generation_url: args.generation_url.clone(),
         };
-        
+
         // Spawn HTTP server task
         tokio::spawn(async move {
             loop {
@@ -1004,13 +1079,16 @@ async fn main() -> anyhow::Result<()> {
                 let service = stream_service.clone();
                 tokio::spawn(async move {
                     let _result = Builder::new(TokioExecutor::default())
-                        .serve_connection_with_upgrades(io, hyper::service::service_fn(move |req| service.call(req)))
+                        .serve_connection_with_upgrades(
+                            io,
+                            hyper::service::service_fn(move |req| service.call(req)),
+                        )
                         .await;
                 });
             }
         });
     }
-    
+
     // Run main MCP server
     loop {
         let io = tokio::select! {

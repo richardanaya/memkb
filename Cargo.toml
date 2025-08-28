@@ -3,6 +3,7 @@ name = "memkb"
 description = "A local AI in memory RAG for markdown files in a folder exposed as MCP"
 version = "0.0.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 rmcp = { version="0", features = [

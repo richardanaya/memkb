@@ -29,4 +29,6 @@ hyper = { version = "1" }
 hyper-util = { version = "0", features = ["server"] }
 tokio-util = { version = "0.7" }
 clap = { version = "4.0", features = ["derive"] }
+walkdir = "2.5"
 openai-api-rs = "6.0.9"
+schemars = "1.0.4"

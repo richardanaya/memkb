@@ -10,8 +10,12 @@ use rmcp::transport::streamable_http_server::{
 };
 use openai_api_rs::v1::{api::OpenAIClient, chat_completion::{self, ChatCompletionMessage, ChatCompletionRequest, MessageRole}, embedding::{EmbeddingRequest, EncodingFormat}};
 use rmcp::{ErrorData as McpError, model::*, tool, tool_router,tool_handler, handler::server::router::tool::ToolRouter};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
+use std::fs;
+use walkdir::WalkDir;
+use rmcp::handler::server::tool::Parameters;
+
 
 #[derive(Parser)]
 #[command(name = "memkb")]
@@ -30,45 +34,51 @@ struct Args {
     generation_url: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct AskRequest {
+    prompt: String,
+}
+
 #[derive(Clone)]
-pub struct Counter {
-    counter: Arc<Mutex<i32>>,
+pub struct MemoryKB {
+    directory: String,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
-impl Counter {
-    fn new() -> Self {
+impl MemoryKB {
+    fn new(directory: String) -> Self {
         Self {
-            counter: Arc::new(Mutex::new(0)),
+            directory,
             tool_router: Self::tool_router(),
         }
     }
 
-    #[tool(description = "Increment the counter by 1")]
-    async fn increment(&self) -> Result<CallToolResult, McpError> {
-        let mut counter = self.counter.lock().await;
-        *counter += 1;
-        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            counter.to_string(),
-        )]))
-    }
-
-    #[tool(description = "Get the current counter value")]
-    async fn get(&self) -> Result<CallToolResult, McpError> {
-        let counter = self.counter.lock().await;
-        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            counter.to_string(),
-        )]))
+    #[tool(name = "ask", description = "Ask a question and get relevant content from all markdown files")]
+    async fn ask(&self, params: Parameters<AskRequest>) -> Result<CallToolResult, McpError> {
+        let _prompt = &params.0.prompt; // Access the prompt parameter
+        
+        match read_and_merge_markdown_files(&self.directory) {
+            Ok(merged_content) => {
+                Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                    merged_content,
+                )]))
+            }
+            Err(e) => {
+                Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                    format!("Error reading markdown files: {}", e),
+                )]))
+            }
+        }
     }
 }
 
 // Implement the server handler
 #[tool_handler]
-impl rmcp::ServerHandler for Counter {
+impl rmcp::ServerHandler for MemoryKB {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            instructions: Some("A simple calculator".into()),
+            instructions: Some("Memory knowledge base server - ask questions about markdown content".into()),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
@@ -128,6 +138,48 @@ async fn test_generation_server(url: &str) -> anyhow::Result<()> {
     }
 }
 
+fn scan_directory_for_md_files(dir_path: &str) -> anyhow::Result<(Vec<String>, usize)> {
+    let mut md_files = Vec::new();
+    
+    for entry in WalkDir::new(dir_path) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            if let Some(extension) = entry.path().extension() {
+                if extension == "md" {
+                    if let Some(path_str) = entry.path().to_str() {
+                        md_files.push(path_str.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    let count = md_files.len();
+    Ok((md_files, count))
+}
+
+fn read_and_merge_markdown_files(dir_path: &str) -> anyhow::Result<String> {
+    let mut merged_content = String::new();
+    
+    for entry in WalkDir::new(dir_path) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            if let Some(extension) = entry.path().extension() {
+                if extension == "md" {
+                    let file_path = entry.path();
+                    let content = fs::read_to_string(file_path)?;
+                    
+                    merged_content.push_str(&format!("\n\n# File: {}\n\n", file_path.display()));
+                    merged_content.push_str(&content);
+                    merged_content.push_str("\n\n---\n");
+                }
+            }
+        }
+    }
+    
+    Ok(merged_content)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -135,6 +187,22 @@ async fn main() -> anyhow::Result<()> {
     println!("🚀 Starting memkb MCP server");
     println!("📍 Server running on: http://[::1]:{}", args.port);
     println!("📁 Target directory: {}", args.directory);
+    
+    println!("🔍 Scanning directory for .md files...");
+    match scan_directory_for_md_files(&args.directory) {
+        Ok((md_files, count)) => {
+            println!("📄 Found {} .md files:", count);
+            for (index, file) in md_files.iter().enumerate().take(10) {
+                println!("   {}. {}", index + 1, file);
+            }
+            if count > 10 {
+                println!("   ... and {} more files", count - 10);
+            }
+        }
+        Err(e) => {
+            println!("❌ Error scanning directory: {}", e);
+        }
+    }
     
     if let Some(embedding_url) = &args.embedding_url {
         println!("🧠 Embedding server: {}", embedding_url);
@@ -159,8 +227,9 @@ async fn main() -> anyhow::Result<()> {
     println!("Press Ctrl+C to stop the server");
     println!();
     
+    let directory = args.directory.clone();
     let service = TowerToHyperService::new(StreamableHttpService::new(
-        || Ok(Counter::new()),
+        move || Ok(MemoryKB::new(directory.clone())),
         LocalSessionManager::default().into(),
         Default::default(),
     ));

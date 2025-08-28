@@ -1,29 +1,18 @@
 # MemKB - Memory Knowledge Base
 
-A Rust-based MCP (Model Context Protocol) server that provides AI-powered semantic search over markdown documentation using local LLMs.
+A Rust-based MCP (Model Context Protocol) server that provides AI-powered semantic search over markdown documentation using local LLMs all in memory!
 
 ## Features
 
 - **Semantic Search**: Uses embeddings for intelligent content retrieval
 - **AI-Generated Answers**: Synthesizes information from multiple sources into coherent responses
-- **Web Test Interface**: Built-in HTTP interface for easy testing
-- **Fallback Support**: Works with or without embedding/generation servers
-- **Configurable Chunking**: Customizable text splitting with overlap
 
 ## Quick Start
 
-### Basic Usage (Text Search Only)
-```bash
-cargo run -- --directory ./docs
-```
-
-### With Local LLM Servers
+### Basic Usage 
 ```bash
 # With embedding and generation servers
-cargo run -- -e http://127.0.0.1:9095/v1 -g http://127.0.0.1:9091/v1 --directory ./docs
-
-# Enable web test interface
-cargo run -- -e http://127.0.0.1:9095/v1 -g http://127.0.0.1:9091/v1 --directory ./docs --test
+memkb --directory ./docs -e http://127.0.0.1:9095/v1 -g http://127.0.0.1:9091/v1
 ```
 
 ## Command Line Options

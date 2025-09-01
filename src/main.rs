@@ -33,6 +33,18 @@ use text_splitter::{ChunkConfig, MarkdownSplitter};
 use tokio::sync::Mutex;
 use walkdir::WalkDir;
 
+const SYSTEM_PROMPT: &str = "You are a helpful assistant that answers the user's specific question. Your goal is to directly respond to what the user is asking. You must follow these rules:
+1. Focus solely on answering the user's specific question using information from the provided context
+2. Only use information that is explicitly present in the context provided
+3. If the context doesn't contain relevant information to answer the user's question, respond with \"We don't have knowledge on that question\" and DO NOT include any citations or references section
+4. Never make up information or provide answers from your general knowledge
+5. Always be concise and direct
+6. Answer directly without any preambles or references to documents, text, context, or chunks - just give the answer immediately
+7. IMPORTANT: You must cite your sources using superscript numbers. When you reference information from the context, use superscript numbers like ¹, ², ³ etc. corresponding to the [Citation X] numbers in the context
+8. At the end of your response, include a references section with numbered citations like: 1. filename.md (Line X-Y)
+9. Use multiple citations when drawing from different sources, and be specific about which information comes from which citation
+10. CRITICAL: Only include citations and references when you actually answer the question using the provided context. If you respond with \"We don't have knowledge on that question\", include NO citations or references";
+
 #[derive(Parser)]
 #[command(name = "memkb")]
 #[command(about = "Memory knowledge base MCP server")]
@@ -84,6 +96,8 @@ struct StreamRequest {
 struct TextChunk {
     content: String,
     source_file: String,
+    start_line: usize,
+    end_line: usize,
     embedding: Option<Vec<f32>>,
 }
 
@@ -124,7 +138,7 @@ impl MemoryKB {
                 Ok(content) => content,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                        format!("Error reading markdown files: {}", e),
+                        format!("Error reading markdown files: {e}"),
                     )]));
                 }
             };
@@ -140,8 +154,7 @@ impl MemoryKB {
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
                             format!(
-                                "Error generating answer: {}. Returning raw content:\n\n{}",
-                                e, merged_content
+                                "Error generating answer: {e}. Returning raw content:\n\n{merged_content}"
                             ),
                         )]));
                     }
@@ -157,11 +170,11 @@ impl MemoryKB {
         let query_embedding = match &self.embedding_client {
             Some(client) => {
                 let mut client_guard = client.lock().await;
-                match generate_embedding(&mut *client_guard, prompt).await {
+                match generate_embedding(&mut client_guard, prompt).await {
                     Ok(embedding) => embedding,
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                            format!("Error generating query embedding: {}", e),
+                            format!("Error generating query embedding: {e}"),
                         )]));
                     }
                 }
@@ -187,10 +200,12 @@ impl MemoryKB {
         let mut context = String::new();
         for (i, (similarity, chunk)) in similar_chunks.iter().enumerate() {
             context.push_str(&format!(
-                "Context {} (Similarity: {:.3}) - From: {}\n{}\n\n",
+                "Context {} (Similarity: {:.3}) - From: {} (Line {}-{})\n{}\n\n",
                 i + 1,
                 similarity,
                 chunk.source_file,
+                chunk.start_line,
+                chunk.end_line,
                 chunk.content
             ));
         }
@@ -204,8 +219,7 @@ impl MemoryKB {
                 Err(e) => {
                     // Fall back to returning chunks if generation fails
                     let fallback_response = format!(
-                        "Error generating answer: {}. Here are the relevant chunks:\n\n{}",
-                        e, context
+                        "Error generating answer: {e}. Here are the relevant chunks:\n\n{context}"
                     );
                     Ok(CallToolResult::success(vec![rmcp::model::Content::text(
                         fallback_response,
@@ -259,7 +273,7 @@ async fn test_embedding_server(url: &str) -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => {
-            println!("❌ Embedding server test: FAILED - {}", e);
+            println!("❌ Embedding server test: FAILED - {e}");
             Err(anyhow::anyhow!("Embedding server test failed: {}", e))
         }
     }
@@ -289,7 +303,7 @@ async fn test_generation_server(url: &str) -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => {
-            println!("❌ Generation server test: FAILED - {}", e);
+            println!("❌ Generation server test: FAILED - {e}");
             Err(anyhow::anyhow!("Generation server test failed: {}", e))
         }
     }
@@ -337,13 +351,40 @@ fn read_and_merge_markdown_files(dir_path: &str) -> anyhow::Result<String> {
     Ok(merged_content)
 }
 
-fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+fn chunk_text_with_lines(
+    text: &str,
+    chunk_size: usize,
+    overlap: usize,
+) -> Vec<(String, usize, usize)> {
     // Create a text splitter with specified chunk size and overlap
     let cfg = ChunkConfig::new(chunk_size).with_overlap(overlap).unwrap();
     let splitter = MarkdownSplitter::new(cfg);
 
-    // For now, just use basic splitting. We can enhance with overlap later
-    splitter.chunks(text).map(|s| s.to_string()).collect()
+    let mut chunks_with_lines = Vec::new();
+    let _lines: Vec<&str> = text.lines().collect();
+
+    // Get chunks from the splitter
+    let chunks: Vec<String> = splitter.chunks(text).map(|s| s.to_string()).collect();
+
+    for chunk in chunks {
+        // Find the line numbers for this chunk by searching in the original text
+        let mut start_line = 1;
+        let mut end_line = 1;
+
+        // Find the first occurrence of the chunk in the text
+        if let Some(chunk_start) = text.find(&chunk) {
+            // Count newlines before this position to get start line
+            start_line = text[..chunk_start].matches('\n').count() + 1;
+
+            // Count newlines within the chunk to get end line
+            let chunk_newlines = chunk.matches('\n').count();
+            end_line = start_line + chunk_newlines;
+        }
+
+        chunks_with_lines.push((chunk, start_line, end_line));
+    }
+
+    chunks_with_lines
 }
 
 async fn chunk_and_embed_files(
@@ -365,12 +406,14 @@ async fn chunk_and_embed_files(
                     let source_file = file_path.to_string_lossy().to_string();
 
                     // Chunk the content with configurable size and overlap
-                    let text_chunks = chunk_text(&content, chunk_size, overlap);
+                    let text_chunks = chunk_text_with_lines(&content, chunk_size, overlap);
 
-                    for chunk_content in text_chunks {
+                    for (chunk_content, start_line, end_line) in text_chunks {
                         let chunk = TextChunk {
                             content: chunk_content,
                             source_file: source_file.clone(),
+                            start_line,
+                            end_line,
                             embedding: None,
                         };
                         chunks.push(chunk);
@@ -383,7 +426,7 @@ async fn chunk_and_embed_files(
     // Second pass: generate embeddings with progress counter
     if let Some(client) = embedding_client {
         let total_chunks = chunks.len();
-        println!("📊 Generating embeddings for {} chunks...", total_chunks);
+        println!("📊 Generating embeddings for {total_chunks} chunks...");
 
         for (i, chunk) in chunks.iter_mut().enumerate() {
             let progress = i + 1;
@@ -396,7 +439,7 @@ async fn chunk_and_embed_files(
             std::io::stdout().flush().unwrap();
 
             let mut client_guard = client.lock().await;
-            match generate_embedding(&mut *client_guard, &chunk.content).await {
+            match generate_embedding(&mut client_guard, &chunk.content).await {
                 Ok(embedding) => {
                     chunk.embedding = Some(embedding);
                 }
@@ -499,11 +542,10 @@ async fn generate_answer(
 ) -> anyhow::Result<String> {
     let mut client_guard = client.lock().await;
 
-    let system_prompt = "You are a helpful assistant that answers questions based on the provided context. If the context doesn't contain relevant information to answer the question, respond with \"We don't have any information on that question\". Always base your answer strictly on the provided context and be concise.";
+    let system_prompt = SYSTEM_PROMPT;
 
     let user_prompt = format!(
-        "Context:\n{}\n\nQuestion: {}\n\nPlease provide a helpful answer based on the context above.",
-        context, question
+        "Context:\n{context}\n\nQuestion: {question}\n\nPlease provide a helpful answer based on the context above."
     );
 
     let req = ChatCompletionRequest::new(
@@ -566,7 +608,7 @@ async fn search_knowledge_base_for_questions(
     for question in questions.iter() {
         // Generate embedding for this question
         let mut client_guard = client.lock().await;
-        match generate_embedding(&mut *client_guard, question).await {
+        match generate_embedding(&mut client_guard, question).await {
             Ok(query_embedding) => {
                 drop(client_guard); // Release the lock
                 let similar_chunks = find_similar_chunks(&query_embedding, chunks, 2).await; // Top 2 per question
@@ -590,12 +632,16 @@ async fn search_knowledge_base_for_questions(
         return Ok(String::new());
     }
 
-    // Format as tool context
+    // Format as tool context with citation information
     let mut context = String::new();
-    for (_similarity, chunk) in &top_chunks {
+    for (i, (_similarity, chunk)) in top_chunks.iter().enumerate() {
+        let citation_id = i + 1;
         context.push_str(&format!(
-            "From {}: {}\n\n",
+            "[Citation {}] From {} (Line {}-{}):\n{}\n\n",
+            citation_id,
             chunk.source_file,
+            chunk.start_line,
+            chunk.end_line,
             chunk.content.trim()
         ));
     }
@@ -673,67 +719,199 @@ impl Service<Request<Incoming>> for StreamServer {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>MemKB Test Interface</title>
+    <title>MemKB Chat Interface</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-        .search-form { margin-bottom: 20px; }
-        input[type="text"] { width: 70%; padding: 10px; }
-        button { padding: 10px 20px; }
-        .results { background: #f5f5f5; padding: 15px; border-radius: 5px; }
-        .chunk { margin-bottom: 15px; padding: 10px; background: white; border-radius: 3px; }
-        .chunk-meta { color: #666; font-size: 0.9em; margin-bottom: 5px; }
+        body { font-family: Arial, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .panel { border: 1px solid #ddd; border-radius: 8px; padding: 20px; }
+        .chat-form { margin-bottom: 20px; }
+        textarea { width: 100%; padding: 10px; box-sizing: border-box; min-height: 100px; resize: vertical; }
+        button { padding: 10px 20px; margin: 5px 0; background: #007cba; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #005a87; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .chat-messages { max-height: 400px; overflow-y: auto; border: 1px solid #eee; padding: 15px; border-radius: 5px; margin-bottom: 15px; }
+        .message { margin-bottom: 15px; }
+        .message.user { text-align: right; }
+        .message.assistant { text-align: left; }
+        .message.tool { background: #e8f4fd; padding: 10px; border-radius: 5px; border-left: 4px solid #007cba; margin: 10px 0; }
+        .message-content { display: inline-block; padding: 10px; border-radius: 10px; max-width: 80%; word-wrap: break-word; }
+        .user .message-content { background: #007cba; color: white; }
+        .assistant .message-content { background: #f0f0f0; }
+        .message-role { font-size: 0.8em; color: #666; margin-bottom: 5px; }
+        .streaming-indicator { color: #007cba; font-style: italic; }
+        /* Markdown styles for assistant messages */
+        .message-content h1, .message-content h2, .message-content h3 { margin-top: 0; margin-bottom: 10px; }
+        .message-content h1 { font-size: 1.2em; }
+        .message-content h2 { font-size: 1.1em; }
+        .message-content h3 { font-size: 1em; font-weight: bold; }
+        .message-content p { margin: 8px 0; }
+        .message-content ul, .message-content ol { margin: 8px 0; padding-left: 20px; }
+        .message-content li { margin: 4px 0; }
+        .message-content code { background: #f4f4f4; padding: 2px 4px; border-radius: 3px; font-family: monospace; font-size: 0.9em; }
+        .message-content pre { background: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; margin: 10px 0; }
+        .message-content pre code { background: none; padding: 0; }
+        .message-content blockquote { border-left: 4px solid #ddd; margin: 10px 0; padding-left: 15px; color: #666; }
+        .message-content strong { font-weight: bold; }
+        .message-content em { font-style: italic; }
     </style>
 </head>
 <body>
-    <h1>MemKB Knowledge Base Search</h1>
-    <div class="search-form">
-        <input type="text" id="query" placeholder="Enter your search query..." />
-        <button onclick="search()">Search</button>
+    <h1>MemKB</h1>
+    
+    <div class="panel">
+        <div id="chat-messages" class="chat-messages"></div>
+        <div class="chat-form">
+            <textarea id="chat-input" placeholder="Ask a question about the knowledge base..."></textarea>
+            <button onclick="sendMessage()" id="send-btn">Send</button>
+            <button onclick="clearChat()">Clear Chat</button>
+            <input type="hidden" id="stream-checkbox" checked>
+        </div>
     </div>
-    <div id="results"></div>
 
     <script>
-        async function search() {
-            const query = document.getElementById('query').value;
-            const resultsDiv = document.getElementById('results');
+        let chatMessages = [];
+
+        async function sendMessage() {
+            const input = document.getElementById('chat-input');
+            const sendBtn = document.getElementById('send-btn');
+            const message = input.value.trim();
+            const isStreaming = document.getElementById('stream-checkbox').checked;
             
-            if (!query.trim()) {
-                resultsDiv.innerHTML = '<p>Please enter a search query.</p>';
-                return;
-            }
+            if (!message) return;
             
-            resultsDiv.innerHTML = '<p>Searching...</p>';
+            // Add user message to chat
+            chatMessages.push({ role: 'user', content: message });
+            updateChatDisplay();
+            
+            input.value = '';
+            sendBtn.disabled = true;
             
             try {
-                const response = await fetch('/search', {
+                const payload = {
+                    model: 'gpt-3.5-turbo',
+                    messages: chatMessages,
+                    stream: isStreaming
+                };
+                
+                const response = await fetch('/v1/chat/completions', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query: query })
+                    body: JSON.stringify(payload)
                 });
                 
-                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+                }
                 
-                if (data.results && data.results.length > 0) {
-                    let html = '<div class="results">';
-                    data.results.forEach((result, i) => {
-                        html += `<div class="chunk">
-                            <div class="chunk-meta">Chunk ${i + 1} - Similarity: ${result.similarity.toFixed(3)} - From: ${result.source_file}</div>
-                            <div>${result.content}</div>
-                        </div>`;
-                    });
-                    html += '</div>';
-                    resultsDiv.innerHTML = html;
+                if (isStreaming) {
+                    await handleStreamingResponse(response);
                 } else {
-                    resultsDiv.innerHTML = '<div class="results"><p>No results found.</p></div>';
+                    const data = await response.json();
+                    if (data.choices && data.choices[0] && data.choices[0].message) {
+                        chatMessages.push({
+                            role: 'assistant',
+                            content: data.choices[0].message.content
+                        });
+                        updateChatDisplay();
+                    }
                 }
             } catch (error) {
-                resultsDiv.innerHTML = `<div class="results"><p>Error: ${error.message}</p></div>`;
+                console.error('Chat error:', error);
+                chatMessages.push({
+                    role: 'assistant',
+                    content: `Error: ${error.message}`
+                });
+                updateChatDisplay();
+            } finally {
+                sendBtn.disabled = false;
             }
         }
         
-        document.getElementById('query').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                search();
+        async function handleStreamingResponse(response) {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let assistantMessage = { role: 'assistant', content: '' };
+            chatMessages.push(assistantMessage);
+            
+            // Add streaming indicator
+            const messagesContainer = document.getElementById('chat-messages');
+            const streamingDiv = document.createElement('div');
+            streamingDiv.className = 'streaming-indicator';
+            streamingDiv.textContent = 'Streaming response...';
+            messagesContainer.appendChild(streamingDiv);
+            
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n');
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            if (data === '[DONE]') continue;
+                            
+                            try {
+                                const parsed = JSON.parse(data);
+                                if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
+                                    assistantMessage.content += parsed.choices[0].delta.content;
+                                    updateChatDisplay();
+                                }
+                            } catch (e) {
+                                // Skip invalid JSON chunks
+                            }
+                        }
+                    }
+                }
+            } finally {
+                // Remove streaming indicator
+                if (streamingDiv.parentNode) {
+                    streamingDiv.parentNode.removeChild(streamingDiv);
+                }
+                updateChatDisplay();
+            }
+        }
+        
+        function updateChatDisplay() {
+            const messagesContainer = document.getElementById('chat-messages');
+            messagesContainer.innerHTML = '';
+            
+            chatMessages.forEach(msg => {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${msg.role}`;
+                
+                if (msg.role === 'tool') {
+                    messageDiv.innerHTML = `
+                        <div class="message-role">Knowledge Base Context:</div>
+                        <div class="message-content" style="white-space: pre-wrap;">${msg.content}</div>
+                    `;
+                } else {
+                    const roleLabel = msg.role === 'user' ? 'You' : 'Assistant';
+                    const content = msg.role === 'assistant' ? marked.parse(msg.content) : msg.content;
+                    messageDiv.innerHTML = `
+                        <div class="message-role">${roleLabel}:</div>
+                        <div class="message-content">${content}</div>
+                    `;
+                }
+                
+                messagesContainer.appendChild(messageDiv);
+            });
+            
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+        
+        function clearChat() {
+            chatMessages = [];
+            updateChatDisplay();
+        }
+        
+        // Enter key support
+        document.getElementById('chat-input').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
             }
         });
     </script>
@@ -744,86 +922,11 @@ impl Service<Request<Incoming>> for StreamServer {
                         .header("content-type", "text/html")
                         .body(body_from_string(html.to_string())).unwrap())
                 },
-                (&Method::POST, "/search") => {
-                    let body_bytes = match req.into_body().collect().await {
-                        Ok(collected) => collected.to_bytes(),
-                        Err(_) => {
-                            return Ok(Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(body_from_string("Invalid request body".to_string())).unwrap());
-                        }
-                    };
-                    
-                    let search_req: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                        Ok(req) => req,
-                        Err(_) => {
-                            return Ok(Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(body_from_string("Invalid JSON".to_string())).unwrap());
-                        }
-                    };
-                    
-                    let query = match search_req.get("query").and_then(|q| q.as_str()) {
-                        Some(q) => q,
-                        None => {
-                            return Ok(Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(body_from_string("Missing query field".to_string())).unwrap());
-                        }
-                    };
-                    
-                    let results = if let Some(client) = &embedding_client {
-                        // Use embedding search
-                        match {
-                            let mut client_guard = client.lock().await;
-                            generate_embedding(&mut *client_guard, query).await
-                        } {
-                            Ok(query_embedding) => {
-                                let chunks_guard = chunks.lock().await;
-                                let similar_chunks = find_similar_chunks(&query_embedding, &chunks_guard, 5).await;
-                                
-                                let mut results = Vec::new();
-                                for (similarity, chunk) in similar_chunks {
-                                    results.push(serde_json::json!({
-                                        "similarity": similarity,
-                                        "content": chunk.content,
-                                        "source_file": chunk.source_file
-                                    }));
-                                }
-                                results
-                            }
-                            Err(_) => Vec::new(),
-                        }
-                    } else {
-                        // Fallback to simple text matching
-                        let chunks_guard = chunks.lock().await;
-                        let mut results = Vec::new();
-                        let query_lower = query.to_lowercase();
-                        
-                        for chunk in chunks_guard.iter() {
-                            if chunk.content.to_lowercase().contains(&query_lower) {
-                                results.push(serde_json::json!({
-                                    "similarity": 1.0,
-                                    "content": chunk.content,
-                                    "source_file": chunk.source_file
-                                }));
-                                if results.len() >= 5 { break; }
-                            }
-                        }
-                        results
-                    };
-                    
-                    let response_json = serde_json::json!({ "results": results });
-                    
-                    Ok(Response::builder()
-                        .header("content-type", "application/json")
-                        .body(body_from_string(response_json.to_string())).unwrap())
-                },
                 (&Method::POST, "/v1/chat/completions") => {
                     let body_bytes = match req.into_body().collect().await {
                         Ok(collected) => collected.to_bytes(),
                         Err(e) => {
-                            println!("❌ Failed to read request body: {:?}", e);
+                            println!("❌ Failed to read request body: {e:?}");
                             return Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
                                 .body(body_from_string("Invalid request body".to_string())).unwrap());
@@ -833,7 +936,7 @@ impl Service<Request<Incoming>> for StreamServer {
                     let stream_req: StreamRequest = match serde_json::from_slice::<StreamRequest>(&body_bytes) {
                         Ok(req) => req,
                         Err(e) => {
-                            println!("❌ Failed to parse JSON: {:?}", e);
+                            println!("❌ Failed to parse JSON: {e:?}");
                             return Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
                                 .body(body_from_string("Invalid JSON".to_string())).unwrap());
@@ -857,6 +960,17 @@ impl Service<Request<Incoming>> for StreamServer {
                     // Two-phase approach: Generate search questions, then search knowledge base
                     let mut augmented_messages = stream_req.messages.clone();
                     
+                    // Add system prompt at the beginning if not already present
+                    let has_system_message = augmented_messages.iter().any(|msg| msg.role == "system");
+                    if !has_system_message {
+                        let system_prompt = SYSTEM_PROMPT;
+                        
+                        augmented_messages.insert(0, Message {
+                            role: "system".to_string(),
+                            content: system_prompt.to_string(),
+                        });
+                    }
+                    
                     // Phase 1: Generate search questions if we have a generation client
                     if let Some(gen_client) = &generation_client {
                         match generate_search_questions(gen_client, &stream_req.messages).await {
@@ -876,13 +990,13 @@ impl Service<Request<Incoming>> for StreamServer {
                                             }
                                         }
                                         Err(e) => {
-                                            println!("❌ Failed to search knowledge base: {:?}", e);
+                                            println!("❌ Failed to search knowledge base: {e:?}");
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
-                                println!("❌ Failed to generate search questions: {:?}", e);
+                                println!("❌ Failed to generate search questions: {e:?}");
                             }
                         }
                     }
@@ -944,10 +1058,10 @@ impl Service<Request<Incoming>> for StreamServer {
                                         Frame::data(bytes)
                                     })
                                     .map_err(|e| {
-                                        eprintln!("Stream error: {:?}", e);
+                                        eprintln!("Stream error: {e:?}");
                                         // Create a hyper error - hyper::Error doesn't have From<io::Error>
                                         // so we need to find another way
-                                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Stream error: {}", e))) as Box<dyn std::error::Error + Send + Sync>
+                                        Box::new(std::io::Error::other(format!("Stream error: {e}"))) as Box<dyn std::error::Error + Send + Sync>
                                     });
                                 
                                 let body = BodyExt::boxed(StreamBody::new(stream));
@@ -972,10 +1086,10 @@ impl Service<Request<Incoming>> for StreamServer {
                             }
                         }
                         Err(e) => {
-                            println!("❌ Failed to connect to generation endpoint: {:?}", e);
+                            println!("❌ Failed to connect to generation endpoint: {e:?}");
                             Ok(Response::builder()
                                 .status(StatusCode::BAD_GATEWAY)
-                                .body(body_from_string(format!("Failed to connect to generation endpoint: {}", e)))
+                                .body(body_from_string(format!("Failed to connect to generation endpoint: {e}")))
                                 .unwrap())
                         }
                     }
@@ -1001,7 +1115,7 @@ async fn main() -> anyhow::Result<()> {
     println!("🔍 Scanning directory for .md files...");
     match scan_directory_for_md_files(&args.directory) {
         Ok((md_files, count)) => {
-            println!("📄 Found {} .md files:", count);
+            println!("📄 Found {count} .md files:");
             for (index, file) in md_files.iter().enumerate().take(10) {
                 println!("   {}. {}", index + 1, file);
             }
@@ -1010,55 +1124,47 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Err(e) => {
-            println!("❌ Error scanning directory: {}", e);
+            println!("❌ Error scanning directory: {e}");
         }
     }
 
     if let Some(embedding_url) = &args.embedding_url {
-        println!("🧠 Embedding server: {}", embedding_url);
+        println!("🧠 Embedding server: {embedding_url}");
         println!("🔍 Testing embedding server...");
         if let Err(e) = test_embedding_server(embedding_url).await {
-            println!("⚠️  Warning: Embedding server test failed: {}", e);
+            println!("⚠️  Warning: Embedding server test failed: {e}");
         }
     } else {
         println!("🧠 Embedding server: Not configured");
     }
 
     if let Some(generation_url) = &args.generation_url {
-        println!("✨ Generation server: {}", generation_url);
+        println!("✨ Generation server: {generation_url}");
         println!("🔍 Testing generation server...");
         if let Err(e) = test_generation_server(generation_url).await {
-            println!("⚠️  Warning: Generation server test failed: {}", e);
+            println!("⚠️  Warning: Generation server test failed: {e}");
         }
     } else {
         println!("✨ Generation server: Not configured");
     }
 
     // Initialize embedding client if URL provided
-    let embedding_client = if let Some(embedding_url) = &args.embedding_url {
-        Some(Arc::new(Mutex::new(
+    let embedding_client = args.embedding_url.as_ref().map(|embedding_url| Arc::new(Mutex::new(
             OpenAIClient::builder()
                 .with_endpoint(embedding_url)
                 .with_api_key("test")
                 .build()
                 .unwrap(),
-        )))
-    } else {
-        None
-    };
+        )));
 
     // Initialize generation client if URL provided
-    let generation_client = if let Some(generation_url) = &args.generation_url {
-        Some(Arc::new(Mutex::new(
+    let generation_client = args.generation_url.as_ref().map(|generation_url| Arc::new(Mutex::new(
             OpenAIClient::builder()
                 .with_endpoint(generation_url)
                 .with_api_key("test")
                 .build()
                 .unwrap(),
-        )))
-    } else {
-        None
-    };
+        )));
 
     // Process and embed all markdown files
     println!("🧠 Processing and embedding markdown files...");
@@ -1087,7 +1193,7 @@ async fn main() -> anyhow::Result<()> {
             chunks
         }
         Err(e) => {
-            println!("❌ Error processing files: {}", e);
+            println!("❌ Error processing files: {e}");
             Vec::new()
         }
     };
@@ -1126,11 +1232,10 @@ async fn main() -> anyhow::Result<()> {
         let http_bind_addr = format!("{}:{}", args.host, http_port);
         let http_listener = tokio::net::TcpListener::bind(&http_bind_addr).await?;
 
-        println!("🌐 Starting HTTP server at http://{}", http_bind_addr);
+        println!("🌐 Starting HTTP server at http://{http_bind_addr}");
         println!("   Available endpoints:");
-        println!("     GET  / - Search interface");
-        println!("     POST /search - Search knowledge base");
-        println!("     POST /v1/chat/completion - Streaming endpoint with knowledge augmentation");
+        println!("     GET  / - Web chat interface");
+        println!("     POST /v1/chat/completions - Chat completions with knowledge augmentation");
 
         let stream_service = StreamServer {
             chunks: chunks_arc.clone(),

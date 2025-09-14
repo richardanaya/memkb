@@ -17,6 +17,7 @@ use openai_api_rs::v1::{
     chat_completion::{self, ChatCompletionMessage, ChatCompletionRequest, MessageRole},
     embedding::{EmbeddingRequest, EncodingFormat},
 };
+use rag_umap::{convert_to_2d, convert_to_3d};
 use rmcp::handler::server::tool::Parameters;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager,
@@ -93,6 +94,26 @@ struct StreamRequest {
     model: Option<String>,
     messages: Vec<Message>,
     stream: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UmapRequest {
+    embeddings: Vec<Vec<f64>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UmapPoint {
+    coordinates: Vec<f64>,
+    text: String,
+    source_file: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UmapResponse {
+    points: Vec<UmapPoint>,
+    dimensions: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -831,8 +852,16 @@ impl Service<Request<Incoming>> for StreamServer {
             <textarea id="chat-input" placeholder="Ask a question about the knowledge base..."></textarea>
             <button onclick="sendMessage()" id="send-btn">Send</button>
             <button onclick="clearChat()">Clear Chat</button>
+            <button onclick="visualizeUmap2D()">Visualize 2D UMAP</button>
+            <button onclick="visualizeUmap3D()">Visualize 3D UMAP</button>
             <input type="hidden" id="stream-checkbox" checked>
         </div>
+    </div>
+
+    <div id="umap-panel" class="panel" style="display: none; margin-top: 20px;">
+        <h3 id="umap-title">UMAP Visualization</h3>
+        <div id="umap-container" style="width: 100%; height: 500px; border: 1px solid #ddd; background: #f9f9f9;"></div>
+        <button onclick="closeUmapVisualization()">Close Visualization</button>
     </div>
 
     <script>
@@ -981,6 +1010,264 @@ impl Service<Request<Incoming>> for StreamServer {
                 sendMessage();
             }
         });
+
+        // UMAP Visualization Functions
+        async function visualizeUmap2D() {
+            try {
+                const response = await fetch('/umap/2d', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+                }
+
+                const data = await response.json();
+                displayUmapVisualization(data, '2D');
+            } catch (error) {
+                console.error('UMAP 2D error:', error);
+                alert(`UMAP 2D visualization failed: ${error.message}`);
+            }
+        }
+
+        async function visualizeUmap3D() {
+            try {
+                const response = await fetch('/umap/3d', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+                }
+
+                const data = await response.json();
+                displayUmapVisualization(data, '3D');
+            } catch (error) {
+                console.error('UMAP 3D error:', error);
+                alert(`UMAP 3D visualization failed: ${error.message}`);
+            }
+        }
+
+        function displayUmapVisualization(data, dimensions) {
+            const panel = document.getElementById('umap-panel');
+            const title = document.getElementById('umap-title');
+            const container = document.getElementById('umap-container');
+
+            title.textContent = `UMAP ${dimensions} Visualization (${data.points.length} points)`;
+            panel.style.display = 'block';
+
+            // Clear previous visualization
+            container.innerHTML = '';
+
+            if (dimensions === '2D') {
+                create2DVisualization(container, data.points);
+            } else {
+                create3DVisualization(container, data.points);
+            }
+        }
+
+        function create2DVisualization(container, points) {
+            // Create SVG for 2D visualization
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            svg.setAttribute('width', '100%');
+            svg.setAttribute('height', '100%');
+            svg.style.background = '#f9f9f9';
+
+            // Calculate bounds
+            const xCoords = points.map(p => p.coordinates[0]);
+            const yCoords = points.map(p => p.coordinates[1]);
+            const minX = Math.min(...xCoords);
+            const maxX = Math.max(...xCoords);
+            const minY = Math.min(...yCoords);
+            const maxY = Math.max(...yCoords);
+
+            const padding = 40;
+            const width = container.offsetWidth - padding * 2;
+            const height = container.offsetHeight - padding * 2;
+
+            // Create tooltip
+            const tooltip = document.createElement('div');
+            tooltip.style.position = 'absolute';
+            tooltip.style.background = 'rgba(0, 0, 0, 0.8)';
+            tooltip.style.color = 'white';
+            tooltip.style.padding = '8px';
+            tooltip.style.borderRadius = '4px';
+            tooltip.style.fontSize = '12px';
+            tooltip.style.maxWidth = '300px';
+            tooltip.style.display = 'none';
+            tooltip.style.pointerEvents = 'none';
+            tooltip.style.zIndex = '1000';
+            container.appendChild(tooltip);
+
+            points.forEach((point, index) => {
+                const x = padding + ((point.coordinates[0] - minX) / (maxX - minX)) * width;
+                const y = padding + ((maxY - point.coordinates[1]) / (maxY - minY)) * height;
+
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('cx', x);
+                circle.setAttribute('cy', y);
+                circle.setAttribute('r', '4');
+                circle.setAttribute('fill', `hsl(${(index * 137.5) % 360}, 50%, 50%)`);
+                circle.setAttribute('stroke', '#333');
+                circle.setAttribute('stroke-width', '1');
+                circle.style.cursor = 'pointer';
+
+                circle.addEventListener('mouseenter', (e) => {
+                    const rect = container.getBoundingClientRect();
+                    tooltip.style.left = (e.clientX - rect.left + 10) + 'px';
+                    tooltip.style.top = (e.clientY - rect.top - 10) + 'px';
+                    tooltip.innerHTML = `
+                        <strong>${point.source_file}</strong><br/>
+                        Lines ${point.start_line}-${point.end_line}<br/>
+                        <em>${point.text.substring(0, 200)}${point.text.length > 200 ? '...' : ''}</em>
+                    `;
+                    tooltip.style.display = 'block';
+                });
+
+                circle.addEventListener('mouseleave', () => {
+                    tooltip.style.display = 'none';
+                });
+
+                svg.appendChild(circle);
+            });
+
+            container.appendChild(svg);
+        }
+
+        function create3DVisualization(container, points) {
+            // For 3D visualization, create a simple rotating view or use HTML5 canvas
+            // This is a simplified 3D visualization using HTML5 Canvas
+            const canvas = document.createElement('canvas');
+            canvas.width = container.offsetWidth;
+            canvas.height = container.offsetHeight;
+            canvas.style.background = '#f9f9f9';
+
+            const ctx = canvas.getContext('2d');
+            let rotation = 0;
+
+            // Calculate bounds
+            const xCoords = points.map(p => p.coordinates[0]);
+            const yCoords = points.map(p => p.coordinates[1]);
+            const zCoords = points.map(p => p.coordinates[2]);
+            const minX = Math.min(...xCoords);
+            const maxX = Math.max(...xCoords);
+            const minY = Math.min(...yCoords);
+            const maxY = Math.max(...yCoords);
+            const minZ = Math.min(...zCoords);
+            const maxZ = Math.max(...zCoords);
+
+            // Create tooltip
+            const tooltip = document.createElement('div');
+            tooltip.style.position = 'absolute';
+            tooltip.style.background = 'rgba(0, 0, 0, 0.8)';
+            tooltip.style.color = 'white';
+            tooltip.style.padding = '8px';
+            tooltip.style.borderRadius = '4px';
+            tooltip.style.fontSize = '12px';
+            tooltip.style.maxWidth = '300px';
+            tooltip.style.display = 'none';
+            tooltip.style.pointerEvents = 'none';
+            tooltip.style.zIndex = '1000';
+            container.appendChild(tooltip);
+
+            function project3D(x, y, z, rotation) {
+                // Simple 3D to 2D projection with rotation
+                const cos = Math.cos(rotation);
+                const sin = Math.sin(rotation);
+
+                const rotatedX = x * cos - z * sin;
+                const rotatedZ = x * sin + z * cos;
+
+                const scale = 200 / (rotatedZ + 5); // Perspective
+                const projectedX = canvas.width / 2 + rotatedX * scale;
+                const projectedY = canvas.height / 2 - y * scale;
+
+                return { x: projectedX, y: projectedY, scale };
+            }
+
+            function draw() {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                // Normalize and project points
+                const projectedPoints = points.map((point, index) => {
+                    const normalizedX = ((point.coordinates[0] - minX) / (maxX - minX) - 0.5) * 4;
+                    const normalizedY = ((point.coordinates[1] - minY) / (maxY - minY) - 0.5) * 4;
+                    const normalizedZ = ((point.coordinates[2] - minZ) / (maxZ - minZ) - 0.5) * 4;
+
+                    const projected = project3D(normalizedX, normalizedY, normalizedZ, rotation);
+                    return { ...projected, point, index };
+                });
+
+                // Sort by z-depth for proper rendering
+                projectedPoints.sort((a, b) => b.scale - a.scale);
+
+                // Draw points
+                projectedPoints.forEach(({ x, y, scale, point, index }) => {
+                    const radius = Math.max(2, 6 * scale * 0.1);
+                    ctx.beginPath();
+                    ctx.arc(x, y, radius, 0, 2 * Math.PI);
+                    ctx.fillStyle = `hsl(${(index * 137.5) % 360}, 50%, 50%)`;
+                    ctx.fill();
+                    ctx.strokeStyle = '#333';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                });
+
+                rotation += 0.01;
+                requestAnimationFrame(draw);
+            }
+
+            // Mouse interaction for tooltip
+            canvas.addEventListener('mousemove', (e) => {
+                const rect = canvas.getBoundingClientRect();
+                const mouseX = e.clientX - rect.left;
+                const mouseY = e.clientY - rect.top;
+
+                // Find closest point
+                let closestPoint = null;
+                let minDistance = Infinity;
+
+                points.forEach((point, index) => {
+                    const normalizedX = ((point.coordinates[0] - minX) / (maxX - minX) - 0.5) * 4;
+                    const normalizedY = ((point.coordinates[1] - minY) / (maxY - minY) - 0.5) * 4;
+                    const normalizedZ = ((point.coordinates[2] - minZ) / (maxZ - minZ) - 0.5) * 4;
+
+                    const projected = project3D(normalizedX, normalizedY, normalizedZ, rotation);
+                    const distance = Math.sqrt((projected.x - mouseX) ** 2 + (projected.y - mouseY) ** 2);
+
+                    if (distance < 15 && distance < minDistance) {
+                        minDistance = distance;
+                        closestPoint = point;
+                    }
+                });
+
+                if (closestPoint) {
+                    tooltip.style.left = (e.clientX - rect.left + 10) + 'px';
+                    tooltip.style.top = (e.clientY - rect.top - 10) + 'px';
+                    tooltip.innerHTML = `
+                        <strong>${closestPoint.source_file}</strong><br/>
+                        Lines ${closestPoint.start_line}-${closestPoint.end_line}<br/>
+                        <em>${closestPoint.text.substring(0, 200)}${closestPoint.text.length > 200 ? '...' : ''}</em>
+                    `;
+                    tooltip.style.display = 'block';
+                } else {
+                    tooltip.style.display = 'none';
+                }
+            });
+
+            canvas.addEventListener('mouseleave', () => {
+                tooltip.style.display = 'none';
+            });
+
+            container.appendChild(canvas);
+            draw();
+        }
+
+        function closeUmapVisualization() {
+            document.getElementById('umap-panel').style.display = 'none';
+        }
     </script>
 </body>
 </html>
@@ -1161,6 +1448,134 @@ impl Service<Request<Incoming>> for StreamServer {
                         }
                     }
                 },
+                (&Method::POST, "/umap/2d") => {
+                    // Use embeddings from existing chunks
+                    let chunks_guard = chunks.lock().await;
+                    let embedded_chunks: Vec<_> = chunks_guard
+                        .iter()
+                        .filter(|chunk| chunk.embedding.is_some())
+                        .collect();
+
+                    if embedded_chunks.is_empty() {
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(body_from_string("No embedded chunks available".to_string())).unwrap());
+                    }
+
+                    // Extract embeddings and convert to f64
+                    let embeddings: Vec<Vec<f64>> = embedded_chunks
+                        .iter()
+                        .map(|chunk| {
+                            chunk.embedding.as_ref().unwrap()
+                                .iter()
+                                .map(|&x| x as f64)
+                                .collect()
+                        })
+                        .collect();
+
+                    match convert_to_2d(embeddings) {
+                        Ok(result_2d) => {
+                            // Combine UMAP results with original text chunks
+                            let points: Vec<UmapPoint> = result_2d
+                                .into_iter()
+                                .zip(embedded_chunks.iter())
+                                .map(|(coordinates, chunk)| UmapPoint {
+                                    coordinates,
+                                    text: chunk.content.clone(),
+                                    source_file: chunk.source_file.clone(),
+                                    start_line: chunk.start_line,
+                                    end_line: chunk.end_line,
+                                })
+                                .collect();
+
+                            let response = UmapResponse {
+                                points,
+                                dimensions: 2,
+                            };
+
+                            match serde_json::to_string(&response) {
+                                Ok(json) => Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("content-type", "application/json")
+                                    .header("access-control-allow-origin", "*")
+                                    .body(body_from_string(json)).unwrap()),
+                                Err(e) => Ok(Response::builder()
+                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                    .body(body_from_string(format!("Failed to serialize response: {e}"))).unwrap())
+                            }
+                        }
+                        Err(e) => {
+                            println!("❌ UMAP 2D conversion failed: {e:?}");
+                            Ok(Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(body_from_string(format!("UMAP 2D conversion failed: {e}"))).unwrap())
+                        }
+                    }
+                },
+                (&Method::POST, "/umap/3d") => {
+                    // Use embeddings from existing chunks
+                    let chunks_guard = chunks.lock().await;
+                    let embedded_chunks: Vec<_> = chunks_guard
+                        .iter()
+                        .filter(|chunk| chunk.embedding.is_some())
+                        .collect();
+
+                    if embedded_chunks.is_empty() {
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(body_from_string("No embedded chunks available".to_string())).unwrap());
+                    }
+
+                    // Extract embeddings and convert to f64
+                    let embeddings: Vec<Vec<f64>> = embedded_chunks
+                        .iter()
+                        .map(|chunk| {
+                            chunk.embedding.as_ref().unwrap()
+                                .iter()
+                                .map(|&x| x as f64)
+                                .collect()
+                        })
+                        .collect();
+
+                    match convert_to_3d(embeddings) {
+                        Ok(result_3d) => {
+                            // Combine UMAP results with original text chunks
+                            let points: Vec<UmapPoint> = result_3d
+                                .into_iter()
+                                .zip(embedded_chunks.iter())
+                                .map(|(coordinates, chunk)| UmapPoint {
+                                    coordinates,
+                                    text: chunk.content.clone(),
+                                    source_file: chunk.source_file.clone(),
+                                    start_line: chunk.start_line,
+                                    end_line: chunk.end_line,
+                                })
+                                .collect();
+
+                            let response = UmapResponse {
+                                points,
+                                dimensions: 3,
+                            };
+
+                            match serde_json::to_string(&response) {
+                                Ok(json) => Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("content-type", "application/json")
+                                    .header("access-control-allow-origin", "*")
+                                    .body(body_from_string(json)).unwrap()),
+                                Err(e) => Ok(Response::builder()
+                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                    .body(body_from_string(format!("Failed to serialize response: {e}"))).unwrap())
+                            }
+                        }
+                        Err(e) => {
+                            println!("❌ UMAP 3D conversion failed: {e:?}");
+                            Ok(Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(body_from_string(format!("UMAP 3D conversion failed: {e}"))).unwrap())
+                        }
+                    }
+                },
                 _ => {
                     Ok(Response::builder()
                         .status(StatusCode::NOT_FOUND)
@@ -1308,6 +1723,8 @@ async fn main() -> anyhow::Result<()> {
         println!("   Available endpoints:");
         println!("     GET  / - Web chat interface");
         println!("     POST /v1/chat/completions - Chat completions with knowledge augmentation");
+        println!("     POST /umap/2d - Convert high-dimensional embeddings to 2D using UMAP");
+        println!("     POST /umap/3d - Convert high-dimensional embeddings to 3D using UMAP");
 
         let stream_service = StreamServer {
             chunks: chunks_arc.clone(),

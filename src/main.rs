@@ -72,6 +72,9 @@ struct Args {
 
     #[arg(long)]
     http: bool,
+
+    #[arg(short = 'j', long, default_value = "1")]
+    parallel_embeddings: usize,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -273,8 +276,9 @@ async fn test_embedding_server(url: &str) -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => {
-            println!("❌ Embedding server test: FAILED - {e}");
-            Err(anyhow::anyhow!("Embedding server test failed: {}", e))
+            let msg = sanitize_error_message(&format!("{e}"));
+            println!("❌ Embedding server test: FAILED - {msg}");
+            Err(anyhow::anyhow!("Embedding server test failed: {}", msg))
         }
     }
 }
@@ -387,11 +391,41 @@ fn chunk_text_with_lines(
     chunks_with_lines
 }
 
+// Sanitize noisy error messages to avoid dumping massive embedding arrays
+fn sanitize_error_message(raw: &str) -> String {
+    let mut msg = raw.to_string();
+
+    // Trim off any raw JSON payload after a known marker
+    if let Some(idx) = msg.find(" / response ") {
+        msg.truncate(idx);
+    }
+
+    // Collapse very large nested arrays like "[[...]]"
+    if let Some(start) = msg.find("[[") {
+        if let Some(rel_end) = msg[start..].find("]]") {
+            let end = start + rel_end + 2; // include the closing "]]"
+            msg.replace_range(start..end, "[[...]]");
+        } else {
+            msg.replace_range(start.., "[[...]]");
+        }
+    }
+
+    // Final safety cap on length
+    const MAX_LEN: usize = 500;
+    if msg.len() > MAX_LEN {
+        msg.truncate(MAX_LEN);
+        msg.push('…');
+    }
+
+    msg
+}
+
 async fn chunk_and_embed_files(
     dir_path: &str,
     embedding_client: &Option<Arc<Mutex<OpenAIClient>>>,
     chunk_size: usize,
     overlap: usize,
+    parallel_embeddings: usize,
 ) -> anyhow::Result<Vec<TextChunk>> {
     let mut chunks = Vec::new();
 
@@ -423,34 +457,67 @@ async fn chunk_and_embed_files(
         }
     }
 
-    // Second pass: generate embeddings with progress counter
+    // Second pass: generate embeddings with parallel processing
     if let Some(client) = embedding_client {
         let total_chunks = chunks.len();
-        println!("📊 Generating embeddings for {total_chunks} chunks...");
+        println!(
+            "📊 Generating embeddings for {total_chunks} chunks with {parallel_embeddings} parallel workers..."
+        );
 
-        for (i, chunk) in chunks.iter_mut().enumerate() {
-            let progress = i + 1;
-            print!(
-                "\r🔄 Embedding chunk {}/{} ({:.1}%)",
-                progress,
-                total_chunks,
-                (progress as f32 / total_chunks as f32) * 100.0
-            );
-            std::io::stdout().flush().unwrap();
+        use tokio::sync::Semaphore;
 
-            let mut client_guard = client.lock().await;
-            match generate_embedding(&mut client_guard, &chunk.content).await {
-                Ok(embedding) => {
-                    chunk.embedding = Some(embedding);
-                }
-                Err(e) => {
-                    println!(
-                        "\n⚠️  Failed to embed chunk from {}: {}",
-                        chunk.source_file, e
+        let semaphore = Arc::new(Semaphore::new(parallel_embeddings));
+        let completed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let tasks: Vec<_> = chunks
+            .iter_mut()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let client = client.clone();
+                let semaphore = semaphore.clone();
+                let completed_count = completed_count.clone();
+                let chunk_content = chunk.content.clone();
+                let chunk_source = chunk.source_file.clone();
+
+                async move {
+                    let _permit = semaphore.acquire().await.unwrap();
+
+                    let mut client_guard = client.lock().await;
+                    let result = generate_embedding(&mut client_guard, &chunk_content).await;
+                    drop(client_guard);
+
+                    let current_count =
+                        completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    print!(
+                        "\r🔄 Embedding chunk {}/{} ({:.1}%)",
+                        current_count,
+                        total_chunks,
+                        (current_count as f32 / total_chunks as f32) * 100.0
                     );
+                    std::io::stdout().flush().unwrap();
+
+                    match result {
+                        Ok(embedding) => (i, Some(embedding), None),
+                        Err(e) => {
+                            let msg = sanitize_error_message(&format!("{e}"));
+                            (i, None, Some((chunk_source, msg)))
+                        }
+                    }
                 }
+            })
+            .collect();
+
+        let results = futures::future::join_all(tasks).await;
+
+        // Apply results back to chunks
+        for (index, embedding, error) in results {
+            if let Some(embedding) = embedding {
+                chunks[index].embedding = Some(embedding);
+            } else if let Some((source_file, msg)) = error {
+                println!("\n⚠️  Failed to embed chunk from {}: {}", source_file, msg);
             }
         }
+
         println!(); // New line after progress counter
     }
 
@@ -1149,22 +1216,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize embedding client if URL provided
-    let embedding_client = args.embedding_url.as_ref().map(|embedding_url| Arc::new(Mutex::new(
+    let embedding_client = args.embedding_url.as_ref().map(|embedding_url| {
+        Arc::new(Mutex::new(
             OpenAIClient::builder()
                 .with_endpoint(embedding_url)
                 .with_api_key("test")
                 .build()
                 .unwrap(),
-        )));
+        ))
+    });
 
     // Initialize generation client if URL provided
-    let generation_client = args.generation_url.as_ref().map(|generation_url| Arc::new(Mutex::new(
+    let generation_client = args.generation_url.as_ref().map(|generation_url| {
+        Arc::new(Mutex::new(
             OpenAIClient::builder()
                 .with_endpoint(generation_url)
                 .with_api_key("test")
                 .build()
                 .unwrap(),
-        )));
+        ))
+    });
 
     // Process and embed all markdown files
     println!("🧠 Processing and embedding markdown files...");
@@ -1177,6 +1248,7 @@ async fn main() -> anyhow::Result<()> {
         &embedding_client,
         args.chunk_size,
         args.overlap,
+        args.parallel_embeddings,
     )
     .await
     {
